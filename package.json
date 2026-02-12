@@ -4,5 +4,13 @@
   "workspaces": [
     "packages/*",
     "apps/*"
-  ]
+  ],
+  "scripts": {
+    "dev:host": "npm run dev -w @localllm/host",
+    "build:host": "npm run build -w @localllm/host",
+    "test:host": "npm run test -w @localllm/host",
+    "test:protocol": "npm run test -w @localllm/protocol",
+    "test": "npm run test -w @localllm/protocol && npm run test -w @localllm/host && npm run test -w client",
+    "build": "npm run build -w @localllm/protocol && npm run build -w @localllm/host & npm run build -w client & wait"
+  }
 }

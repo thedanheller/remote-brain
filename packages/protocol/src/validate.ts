@@ -7,7 +7,9 @@ import type {
   AbortMessage,
   ErrorMessage,
 } from "./types.js";
-import { MAX_PROMPT_SIZE } from "./helpers.js";
+import { LIMITS } from "./limits.js";
+
+const { MAX_PROMPT_SIZE } = LIMITS;
 
 const VALID_TYPES = new Set([
   "server_info",
