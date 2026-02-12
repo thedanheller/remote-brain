@@ -1,5 +1,5 @@
 export type BridgeCommand =
-  | { type: "connect"; serverId: string }
+  | { type: "connect"; topic: number[] }
   | { type: "disconnect" }
   | { type: "sendPrompt"; prompt: string }
   | { type: "abort" };

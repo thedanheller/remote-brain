@@ -1,4 +1,5 @@
 import { Worklet } from "react-native-bare-kit";
+import bs58 from "bs58";
 import { SWARM_WORKLET_SOURCE } from "../worklet/swarmWorkletSource";
 import type { BridgeCommand, WorkletEvent, WorkletEventHandler } from "../types/bridge";
 
@@ -95,7 +96,30 @@ export class WorkletBridge {
   }
 
   connect(serverId: string): void {
-    this.send({ type: "connect", serverId });
+    const candidate = serverId.trim();
+
+    let topic: Uint8Array;
+    try {
+      topic = bs58.decode(candidate);
+    } catch {
+      this.handler?.({
+        type: "onError",
+        code: "INVALID_SERVER_ID",
+        message: "Could not decode Server ID",
+      });
+      return;
+    }
+
+    if (topic.length !== 32) {
+      this.handler?.({
+        type: "onError",
+        code: "INVALID_SERVER_ID",
+        message: "Server ID must decode to 32 bytes",
+      });
+      return;
+    }
+
+    this.send({ type: "connect", topic: Array.from(topic) });
   }
 
   disconnect(): void {
