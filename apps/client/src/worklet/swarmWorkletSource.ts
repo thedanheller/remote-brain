@@ -1,8 +1,10 @@
+import { ErrorCode, MAX_PROMPT_SIZE } from "@localllm/protocol";
+
 export const SWARM_WORKLET_SOURCE = `
 const { IPC } = BareKit
 const Hyperswarm = require('hyperswarm')
 
-const MAX_PROMPT_SIZE = 8192
+const MAX_PROMPT_SIZE = ${MAX_PROMPT_SIZE}
 const SERVER_INFO_TIMEOUT_MS = 15000
 
 let swarm = null
@@ -54,11 +56,11 @@ function startServerInfoTimeout(targetSocket) {
       return
     }
 
-    emitError('TIMEOUT_NO_RESPONSE', 'No server_info received within 15 seconds')
+    emitError('${ErrorCode.TIMEOUT_NO_RESPONSE}', 'No server_info received within 15 seconds')
     await closeResources()
     emit({
       type: 'onDisconnect',
-      code: 'TIMEOUT_NO_RESPONSE',
+      code: '${ErrorCode.TIMEOUT_NO_RESPONSE}',
       message: 'Connection timed out'
     })
   }, SERVER_INFO_TIMEOUT_MS)
@@ -116,12 +118,12 @@ function handleProtocolLine(line) {
   try {
     message = JSON.parse(line)
   } catch {
-    emitError('BAD_MESSAGE', 'Malformed protocol payload')
+    emitError('${ErrorCode.BAD_MESSAGE}', 'Malformed protocol payload')
     return
   }
 
   if (!message || typeof message.type !== 'string') {
-    emitError('BAD_MESSAGE', 'Protocol message missing type')
+    emitError('${ErrorCode.BAD_MESSAGE}', 'Protocol message missing type')
     return
   }
 
@@ -144,7 +146,7 @@ function handleProtocolLine(line) {
       return
     }
 
-    emitError('BAD_MESSAGE', 'Invalid server_info payload')
+    emitError('${ErrorCode.BAD_MESSAGE}', 'Invalid server_info payload')
     return
   }
 
@@ -161,7 +163,7 @@ function handleProtocolLine(line) {
       return
     }
 
-    emitError('BAD_MESSAGE', 'Invalid chat_chunk payload')
+    emitError('${ErrorCode.BAD_MESSAGE}', 'Invalid chat_chunk payload')
     return
   }
 
@@ -186,7 +188,7 @@ function handleProtocolLine(line) {
       return
     }
 
-    emitError('BAD_MESSAGE', 'Invalid chat_end payload')
+    emitError('${ErrorCode.BAD_MESSAGE}', 'Invalid chat_end payload')
     return
   }
 
@@ -203,11 +205,11 @@ function handleProtocolLine(line) {
       return
     }
 
-    emitError('BAD_MESSAGE', 'Invalid error payload')
+    emitError('${ErrorCode.BAD_MESSAGE}', 'Invalid error payload')
     return
   }
 
-  emitError('BAD_MESSAGE', 'Unsupported protocol message type')
+  emitError('${ErrorCode.BAD_MESSAGE}', 'Unsupported protocol message type')
 }
 
 function onSocketData(chunk) {
@@ -250,7 +252,7 @@ function attachSocket(nextSocket) {
     await closeResources()
     emit({
       type: 'onDisconnect',
-      code: 'HOST_DISCONNECTED',
+      code: '${ErrorCode.HOST_DISCONNECTED}',
       message: 'Host disconnected'
     })
   })
@@ -263,7 +265,7 @@ function attachSocket(nextSocket) {
     await closeResources()
     emit({
       type: 'onDisconnect',
-      code: 'HOST_DISCONNECTED',
+      code: '${ErrorCode.HOST_DISCONNECTED}',
       message: 'Connection error'
     })
   })
@@ -273,14 +275,14 @@ async function handleConnect(topicBytes) {
   await closeResources()
 
   if (!Array.isArray(topicBytes)) {
-    emitError('INVALID_SERVER_ID', 'Topic must be an array of bytes')
+    emitError('${ErrorCode.INVALID_SERVER_ID}', 'Topic must be an array of bytes')
     return
   }
 
   const validLength = topicBytes.length === 32
   const validByteValues = topicBytes.every((value) => Number.isInteger(value) && value >= 0 && value <= 255)
   if (!validLength || !validByteValues) {
-    emitError('INVALID_SERVER_ID', 'Topic must contain exactly 32 bytes')
+    emitError('${ErrorCode.INVALID_SERVER_ID}', 'Topic must contain exactly 32 bytes')
     return
   }
 
@@ -294,41 +296,41 @@ async function handleConnect(topicBytes) {
     })
 
     swarm.on('error', () => {
-      emitError('CONNECT_FAILED', 'Failed to start Hyperswarm client')
+      emitError('${ErrorCode.CONNECT_FAILED}', 'Failed to start Hyperswarm client')
     })
 
     discovery = swarm.join(topic, { server: false, client: true })
     await discovery.flushed()
   } catch {
     await closeResources()
-    emitError('CONNECT_FAILED', 'Failed to join host topic')
+    emitError('${ErrorCode.CONNECT_FAILED}', 'Failed to join host topic')
   }
 }
 
 function handleSendPrompt(prompt) {
   if (typeof prompt !== 'string') {
-    emitError('BAD_MESSAGE', 'Prompt must be a string')
+    emitError('${ErrorCode.BAD_MESSAGE}', 'Prompt must be a string')
     return
   }
 
   const normalized = prompt.trim()
   if (!normalized) {
-    emitError('BAD_MESSAGE', 'Prompt cannot be empty')
+    emitError('${ErrorCode.BAD_MESSAGE}', 'Prompt cannot be empty')
     return
   }
 
   if (normalized.length > MAX_PROMPT_SIZE) {
-    emitError('BAD_MESSAGE', 'Prompt exceeds max size')
+    emitError('${ErrorCode.BAD_MESSAGE}', 'Prompt exceeds max size')
     return
   }
 
   if (!socket) {
-    emitError('HOST_OFFLINE', 'No connected host peer')
+    emitError('${ErrorCode.HOST_OFFLINE}', 'No connected host peer')
     return
   }
 
   if (activeRequestId) {
-    emitError('MODEL_BUSY', 'A request is already active', activeRequestId)
+    emitError('${ErrorCode.MODEL_BUSY}', 'A request is already active', activeRequestId)
     return
   }
 
@@ -344,7 +346,7 @@ function handleSendPrompt(prompt) {
     socket.write(message)
     activeRequestId = requestId
   } catch {
-    emitError('HOST_DISCONNECTED', 'Failed to write to host peer')
+    emitError('${ErrorCode.HOST_DISCONNECTED}', 'Failed to write to host peer')
   }
 }
 
@@ -363,7 +365,7 @@ function handleAbort() {
     emitRawMessage('out', message.trim())
     socket.write(message)
   } catch {
-    emitError('HOST_DISCONNECTED', 'Failed to send abort', requestId)
+    emitError('${ErrorCode.HOST_DISCONNECTED}', 'Failed to send abort', requestId)
   }
 }
 
@@ -372,12 +374,12 @@ IPC.on('data', async (chunk) => {
   try {
     command = JSON.parse(Buffer.from(chunk).toString())
   } catch {
-    emitError('BAD_MESSAGE', 'Bad worklet command')
+    emitError('${ErrorCode.BAD_MESSAGE}', 'Bad worklet command')
     return
   }
 
   if (!command || typeof command.type !== 'string') {
-    emitError('BAD_MESSAGE', 'Missing worklet command type')
+    emitError('${ErrorCode.BAD_MESSAGE}', 'Missing worklet command type')
     return
   }
 
@@ -390,7 +392,7 @@ IPC.on('data', async (chunk) => {
     await closeResources()
     emit({
       type: 'onDisconnect',
-      code: 'USER_DISCONNECTED',
+      code: '${ErrorCode.USER_DISCONNECTED}',
       message: 'Disconnected'
     })
     return
@@ -406,6 +408,6 @@ IPC.on('data', async (chunk) => {
     return
   }
 
-  emitError('BAD_MESSAGE', 'Unknown worklet command')
+  emitError('${ErrorCode.BAD_MESSAGE}', 'Unknown worklet command')
 })
 `;

@@ -1,4 +1,6 @@
 import {
+  CLIENT_TIMEOUT_MS,
+  ErrorCode,
   MAX_PROMPT_SIZE,
   createDecoder,
   encode,
@@ -18,8 +20,6 @@ interface ClientHandlers {
   ) => void;
   onEvent: (event: ProtocolEvent) => void;
 }
-
-const REQUEST_TIMEOUT_MS = 30_000;
 
 export class ProtocolClient {
   private readonly transport: BareSwarmTransport;
@@ -136,7 +136,7 @@ export class ProtocolClient {
           message: {
             type: "error",
             payload: {
-              code: event.code ?? "CONNECT_FAILED",
+              code: event.code ?? ErrorCode.CONNECT_FAILED,
               message: event.message ?? "Connection error",
             },
           } as ErrorMessage,
@@ -215,8 +215,11 @@ export class ProtocolClient {
 
       this.clearRequestState();
       this.handlers.onEvent({ type: "timeout", requestId });
-      this.handlers.onConnectionState("error", "TIMEOUT_NO_RESPONSE: No response for 30 seconds");
-    }, REQUEST_TIMEOUT_MS);
+      this.handlers.onConnectionState(
+        "error",
+        `${ErrorCode.TIMEOUT_NO_RESPONSE}: No response for ${Math.floor(CLIENT_TIMEOUT_MS / 1000)} seconds`,
+      );
+    }, CLIENT_TIMEOUT_MS);
   }
 
   private clearTimeoutGuard(): void {

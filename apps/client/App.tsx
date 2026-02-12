@@ -15,7 +15,7 @@ import {
   View,
 } from "react-native";
 import { CameraView, useCameraPermissions, type BarcodeScanningResult } from "expo-camera";
-import { MAX_PROMPT_SIZE } from "@localllm/protocol";
+import { ErrorCode, MAX_PROMPT_SIZE } from "@localllm/protocol";
 import { WorkletBridge } from "./src/services/workletBridge";
 import type { WorkletEvent } from "./src/types/bridge";
 import { isSendDisabled, parseServerId } from "./src/utils/inputValidation";
@@ -162,7 +162,8 @@ export default function App() {
       }
 
       if (event.type === "onError") {
-        const nextError = event.code === "TIMEOUT_NO_RESPONSE" ? "Connection timed out" : `${event.code}: ${event.message}`;
+        const nextError =
+          event.code === ErrorCode.TIMEOUT_NO_RESPONSE ? "Connection timed out" : `${event.code}: ${event.message}`;
 
         setConnectionError(nextError);
         setLastError(nextError);
@@ -195,14 +196,14 @@ export default function App() {
         setIsGenerating(false);
         activeAssistant.current = null;
 
-        if (event.code !== "USER_DISCONNECTED") {
+        if (event.code !== ErrorCode.USER_DISCONNECTED) {
           setLastError(`${event.code}: ${event.message}`);
           if (lastServerIdRef.current) {
             setServerIdInput(lastServerIdRef.current);
           }
         }
 
-        if (event.code === "HOST_DISCONNECTED") {
+        if (event.code === ErrorCode.HOST_DISCONNECTED) {
           setShowDisconnectedBanner(true);
           setConnectionError(null);
           setScreen("chat");
