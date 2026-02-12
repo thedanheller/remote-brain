@@ -31,6 +31,11 @@ export type WorkletEvent =
       type: "onDisconnect";
       code: string;
       message: string;
+    }
+  | {
+      type: "onRawMessage";
+      direction: "in" | "out";
+      text: string;
     };
 
 export type WorkletEventHandler = (event: WorkletEvent) => void;
