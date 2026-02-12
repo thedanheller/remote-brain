@@ -29,6 +29,8 @@ class HostApp {
       model: this.currentModel,
       hostName: os.hostname(),
       logger: this.relayLogger,
+      onStateChange: () => this.updateState(),
+      onOllamaUnreachable: () => this.handleOllamaUnreachable(),
     });
 
     this.swarmServer = new SwarmServer({
@@ -48,6 +50,7 @@ class HostApp {
       onCopyServerId: () => this.copyServerId(),
       onShowQR: async () => this.showQR(),
       onToggleDebugLogs: () => this.toggleDebugLogs(),
+      onRetryHealthCheck: async () => this.retryHealthCheck(),
       onQuit: () => this.quit(),
     });
   }
@@ -78,6 +81,33 @@ class HostApp {
       this.trayMenu.setState("error", "OLLAMA_NOT_FOUND");
     } else {
       this.logger.log("Ollama is healthy");
+    }
+  }
+
+  /**
+   * Handle Ollama becoming unreachable mid-session.
+   */
+  private handleOllamaUnreachable(): void {
+    this.logger.error("Ollama became unreachable during inference");
+    this.trayMenu.setState("error", "OLLAMA_NOT_FOUND");
+  }
+
+  /**
+   * Retry Ollama health check and recover from error state.
+   */
+  private async retryHealthCheck(): Promise<void> {
+    this.logger.log("Retrying Ollama health check...");
+
+    const ollamaAdapter = new OllamaAdapter("http://localhost:11434", this.logger);
+    const result = await ollamaAdapter.healthCheck();
+
+    if (!result.healthy) {
+      this.logger.error("Ollama health check still failing:", result.error);
+      this.trayMenu.setState("error", "OLLAMA_NOT_FOUND");
+      dialog.showErrorBox("Health Check Failed", result.error || "Ollama is still unreachable");
+    } else {
+      this.logger.log("Ollama health check passed - recovering to ready state");
+      this.trayMenu.setState("ready");
     }
   }
 
@@ -149,7 +179,8 @@ class HostApp {
     if (!this.swarmServer.isRunning()) {
       this.trayMenu.setState("stopped");
     } else if (this.relay.isBusy()) {
-      this.trayMenu.setState("busy");
+      const activeRequestId = this.relay.getActiveRequestId();
+      this.trayMenu.setState("busy", undefined, activeRequestId);
     } else {
       this.trayMenu.setState("ready");
     }
@@ -197,7 +228,11 @@ class HostApp {
     this.swarmLogger.setEnabled(this.debugLogsEnabled);
     this.relayLogger.setEnabled(this.debugLogsEnabled);
 
-    this.logger.log(`Debug logs ${this.debugLogsEnabled ? "enabled" : "disabled"}`);
+    if (this.debugLogsEnabled) {
+      this.logger.log(`Debug logs enabled. Writing to: ${Logger.getLogFilePath()}`);
+    } else {
+      this.logger.log("Debug logs disabled. Only warnings/errors will be logged to file.");
+    }
   }
 
   /**
@@ -218,6 +253,7 @@ class HostApp {
   async cleanup(): Promise<void> {
     await this.stopServer();
     this.trayMenu.destroy();
+    Logger.closeFileStream();
   }
 }
 

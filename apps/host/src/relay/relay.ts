@@ -20,6 +20,8 @@ export interface RelayConfig {
   hostName: string;
   ollamaBaseUrl?: string;
   logger?: Logger;
+  onStateChange?: () => void;
+  onOllamaUnreachable?: () => void;
 }
 
 const SERVER_INFO_TIMEOUT_MS = 5_000;
@@ -167,6 +169,11 @@ export class StreamingRelay {
     // Track this request for this socket
     this.socketMap.set(socket, request_id);
 
+    // Notify state change (inference started)
+    if (this.config.onStateChange) {
+      this.config.onStateChange();
+    }
+
     // Start Ollama generation
     this.ollama.generate(request_id, this.config.model, payload.prompt, {
       onChunk: (text) => {
@@ -187,12 +194,27 @@ export class StreamingRelay {
         socket.write(encode(end));
         this.gate.release(request_id);
         this.socketMap.delete(socket);
+
+        // Notify state change (inference ended)
+        if (this.config.onStateChange) {
+          this.config.onStateChange();
+        }
       },
 
       onError: (code, errorMessage) => {
         socket.write(encode(createErrorMessage(code, errorMessage, request_id)));
         this.gate.release(request_id);
         this.socketMap.delete(socket);
+
+        // If Ollama became unreachable, notify parent
+        if (code === ErrorCode.OLLAMA_NOT_FOUND && this.config.onOllamaUnreachable) {
+          this.config.onOllamaUnreachable();
+        }
+
+        // Notify state change (inference ended with error)
+        if (this.config.onStateChange) {
+          this.config.onStateChange();
+        }
       },
     });
   }
@@ -228,6 +250,13 @@ export class StreamingRelay {
    */
   isBusy(): boolean {
     return this.gate.isBusy();
+  }
+
+  /**
+   * Get the active request ID if any.
+   */
+  getActiveRequestId(): string | null {
+    return this.gate.getActiveRequest();
   }
 
   /**

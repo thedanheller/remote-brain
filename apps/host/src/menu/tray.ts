@@ -15,6 +15,7 @@ export interface MenuCallbacks {
   onCopyServerId: () => void;
   onShowQR: () => Promise<void>;
   onToggleDebugLogs: () => void;
+  onRetryHealthCheck: () => Promise<void>;
   onQuit: () => Promise<void>;
 }
 
@@ -31,6 +32,7 @@ export class TrayMenu {
   private callbacks: MenuCallbacks;
   private qrWindow: BrowserWindow | null = null;
   private errorMessage: string | null = null;
+  private activeRequestId: string | null = null;
 
   constructor(callbacks: MenuCallbacks) {
     this.callbacks = callbacks;
@@ -51,9 +53,10 @@ export class TrayMenu {
   /**
    * Update the application state.
    */
-  setState(state: AppState, errorMessage?: string): void {
+  setState(state: AppState, errorMessage?: string, activeRequestId?: string | null): void {
     this.state = state;
     this.errorMessage = errorMessage || null;
+    this.activeRequestId = activeRequestId ?? null;
     this.updateMenu();
     this.updateTooltip();
   }
@@ -114,6 +117,14 @@ export class TrayMenu {
         enabled: this.state !== "error",
         click: () => this.callbacks.onStartServer(),
       });
+
+      // Show "Retry Health Check" only in error state
+      if (this.state === "error") {
+        template.push({
+          label: "Retry Health Check",
+          click: () => this.callbacks.onRetryHealthCheck(),
+        });
+      }
     } else {
       template.push({
         label: "Stop Server",
@@ -200,9 +211,16 @@ export class TrayMenu {
     if (!this.tray) return;
 
     let tooltip = "LocalLLM Host";
-    tooltip += `\nStatus: ${this.state}`;
-    if (this.state !== "stopped") {
-      tooltip += `\nClients: ${this.clientCount}`;
+
+    if (this.state === "busy" && this.activeRequestId) {
+      tooltip = `Busy — generating for ${this.activeRequestId}`;
+    } else if (this.state === "ready") {
+      tooltip = `Ready — ${this.clientCount} client${this.clientCount !== 1 ? "s" : ""}`;
+    } else {
+      tooltip += `\nStatus: ${this.state}`;
+      if (this.state !== "stopped") {
+        tooltip += `\nClients: ${this.clientCount}`;
+      }
     }
 
     this.tray.setToolTip(tooltip);
