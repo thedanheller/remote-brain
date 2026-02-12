@@ -2,10 +2,8 @@ import Hyperswarm from "hyperswarm";
 import bs58 from "bs58";
 import crypto from "crypto";
 import type { Duplex } from "stream";
-import { encode, ErrorCode, createErrorMessage } from "@localllm/protocol";
+import { encode, ErrorCode, createErrorMessage, LIMITS } from "@localllm/protocol";
 import { Logger } from "../utils/logger.js";
-
-const MAX_CLIENTS = 5;
 
 export interface SwarmServerConfig {
   onConnection: (socket: Duplex) => void;
@@ -57,8 +55,8 @@ export class SwarmServer {
       this.logger.log("New peer connection established");
 
       // Enforce max client cap
-      if (this.connectedSockets.size >= MAX_CLIENTS) {
-        this.logger.warn(`Max clients reached (${MAX_CLIENTS}), rejecting connection`);
+      if (this.connectedSockets.size >= LIMITS.MAX_CLIENTS) {
+        this.logger.warn(`Max clients reached (${LIMITS.MAX_CLIENTS}), rejecting connection`);
         socket.write(encode(createErrorMessage(ErrorCode.CONNECT_FAILED, "Max clients reached")));
         socket.end();
         return;
