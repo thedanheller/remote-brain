@@ -180,6 +180,54 @@ describe("StreamingRelay", () => {
     expect(endMessage?.payload?.finish_reason).toBe("abort");
   });
 
+  it("should close socket if server_info write doesn't flush within 5s", async () => {
+    vi.useFakeTimers();
+
+    // Create a socket that never flushes writes (callback never called)
+    const slowSocket = new MockSocket();
+    const originalWrite = slowSocket.write.bind(slowSocket);
+    let destroyCalled = false;
+
+    slowSocket.write = ((data: any, encodingOrCallback?: any, callback?: any) => {
+      // Accept the data but never call the callback to simulate stalled write
+      return true;
+    }) as any;
+
+    slowSocket.destroy = (() => {
+      destroyCalled = true;
+    }) as any;
+
+    relay.handleConnection(slowSocket);
+
+    // Advance past the 5s timeout
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    expect(destroyCalled).toBe(true);
+
+    vi.useRealTimers();
+  });
+
+  it("should not close socket if server_info flushes in time", async () => {
+    vi.useFakeTimers();
+
+    let destroyCalled = false;
+    const originalDestroy = socket.destroy.bind(socket);
+    socket.destroy = (() => {
+      destroyCalled = true;
+      originalDestroy();
+    }) as any;
+
+    relay.handleConnection(socket);
+
+    // Advance time but within the timeout — write should have flushed synchronously
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    // Socket should NOT be destroyed because write flushed synchronously
+    expect(destroyCalled).toBe(false);
+
+    vi.useRealTimers();
+  });
+
   it("should cleanup on disconnection", () => {
     relay.handleConnection(socket);
 
