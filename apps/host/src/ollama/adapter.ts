@@ -1,4 +1,5 @@
 import { ErrorCode, type ErrorCodeValue } from "@localllm/protocol";
+import { Logger } from "../utils/logger.js";
 
 export interface OllamaGenerateRequest {
   model: string;
@@ -35,9 +36,11 @@ export interface StreamCallbacks {
 export class OllamaAdapter {
   private baseUrl: string;
   private abortControllers = new Map<string, AbortController>();
+  private logger: Logger;
 
-  constructor(baseUrl = "http://localhost:11434") {
+  constructor(baseUrl = "http://localhost:11434", logger?: Logger) {
     this.baseUrl = baseUrl;
+    this.logger = logger || new Logger("OllamaAdapter");
   }
 
   /**
@@ -49,6 +52,7 @@ export class OllamaAdapter {
     prompt: string,
     callbacks: StreamCallbacks,
   ): Promise<void> {
+    this.logger.log(`Starting generation for request ${requestId} with model ${model}`);
     const abortController = new AbortController();
     this.abortControllers.set(requestId, abortController);
 
@@ -76,6 +80,7 @@ export class OllamaAdapter {
         }
 
         const { code, message } = this.mapOllamaError(response.status, errorData.error);
+        this.logger.error(`Generation failed for request ${requestId}: ${message}`);
         callbacks.onError(code, message);
         return;
       }
@@ -115,6 +120,7 @@ export class OllamaAdapter {
             }
 
             if (chunk.done) {
+              this.logger.log(`Generation completed for request ${requestId}`);
               callbacks.onEnd();
               this.abortControllers.delete(requestId);
               return;
@@ -154,11 +160,46 @@ export class OllamaAdapter {
   abort(requestId: string): boolean {
     const controller = this.abortControllers.get(requestId);
     if (controller) {
+      this.logger.log(`Aborting generation for request ${requestId}`);
       controller.abort();
       this.abortControllers.delete(requestId);
       return true;
     }
     return false;
+  }
+
+  /**
+   * Health check - verify Ollama is reachable.
+   */
+  async healthCheck(): Promise<{ healthy: boolean; error?: string }> {
+    try {
+      this.logger.log("Performing Ollama health check...");
+      const response = await fetch(`${this.baseUrl}/api/tags`, {
+        method: "GET",
+      });
+
+      if (!response.ok) {
+        const error = `Ollama health check failed: HTTP ${response.status}`;
+        this.logger.error(error);
+        return { healthy: false, error };
+      }
+
+      this.logger.log("Ollama health check passed");
+      return { healthy: true };
+    } catch (error) {
+      if (error instanceof Error) {
+        if (error.message.includes("ECONNREFUSED")) {
+          const errMsg = "Cannot connect to Ollama (not running?)";
+          this.logger.error(errMsg);
+          return { healthy: false, error: errMsg };
+        }
+        this.logger.error("Ollama health check failed:", error.message);
+        return { healthy: false, error: error.message };
+      }
+      const errMsg = "Unknown error during health check";
+      this.logger.error(errMsg);
+      return { healthy: false, error: errMsg };
+    }
   }
 
   /**

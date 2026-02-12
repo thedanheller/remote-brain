@@ -13,11 +13,13 @@ import {
 } from "@localllm/protocol";
 import { ConcurrencyGate } from "../concurrency/gate.js";
 import { OllamaAdapter } from "../ollama/adapter.js";
+import { Logger } from "../utils/logger.js";
 
 export interface RelayConfig {
   model: string;
   hostName: string;
   ollamaBaseUrl?: string;
+  logger?: Logger;
 }
 
 /**
@@ -28,16 +30,19 @@ export class StreamingRelay {
   private ollama: OllamaAdapter;
   private config: RelayConfig;
   private socketMap = new Map<Duplex, string>();
+  private logger: Logger;
 
   constructor(config: RelayConfig) {
     this.config = config;
-    this.ollama = new OllamaAdapter(config.ollamaBaseUrl);
+    this.logger = config.logger || new Logger("StreamingRelay");
+    this.ollama = new OllamaAdapter(config.ollamaBaseUrl, this.logger);
   }
 
   /**
    * Handle a new client connection.
    */
   handleConnection(socket: Duplex): void {
+    this.logger.log("Handling new client connection");
     const decoder = createDecoder((parsed) => {
       this.handleMessage(socket, parsed);
     });
@@ -54,8 +59,10 @@ export class StreamingRelay {
    * Handle a client disconnection.
    */
   handleDisconnection(socket: Duplex): void {
+    this.logger.log("Handling client disconnection");
     const requestId = this.socketMap.get(socket);
     if (requestId) {
+      this.logger.log(`Cleaning up request ${requestId}`);
       this.ollama.abort(requestId);
       this.gate.release(requestId);
       this.socketMap.delete(socket);
@@ -108,8 +115,11 @@ export class StreamingRelay {
   private handleChatStart(socket: Duplex, message: ChatStartMessage): void {
     const { request_id, payload } = message;
 
+    this.logger.log(`Received chat_start for request ${request_id}`);
+
     // Validate prompt size (max 8 KB)
     if (payload.prompt.length > 8192) {
+      this.logger.warn(`Request ${request_id} rejected: prompt too large`);
       socket.write(
         encode(
           createErrorMessage(
@@ -124,6 +134,7 @@ export class StreamingRelay {
 
     // Try to acquire the concurrency gate
     if (!this.gate.acquire(request_id)) {
+      this.logger.warn(`Request ${request_id} rejected: model busy`);
       socket.write(
         encode(
           createErrorMessage(
@@ -135,6 +146,8 @@ export class StreamingRelay {
       );
       return;
     }
+
+    this.logger.log(`Request ${request_id} acquired concurrency gate`);
 
     // Track this request for this socket
     this.socketMap.set(socket, request_id);
@@ -175,10 +188,13 @@ export class StreamingRelay {
   private handleAbort(socket: Duplex, message: AbortMessage): void {
     const { request_id } = message;
 
+    this.logger.log(`Received abort for request ${request_id}`);
+
     const activeRequest = this.socketMap.get(socket);
     if (activeRequest === request_id) {
       const aborted = this.ollama.abort(request_id);
       if (aborted) {
+        this.logger.log(`Request ${request_id} aborted successfully`);
         this.gate.release(request_id);
         this.socketMap.delete(socket);
 

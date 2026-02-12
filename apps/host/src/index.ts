@@ -3,6 +3,8 @@ import os from "os";
 import { SwarmServer } from "./server/swarm.js";
 import { StreamingRelay } from "./relay/relay.js";
 import { TrayMenu, type AppState } from "./menu/tray.js";
+import { Logger } from "./utils/logger.js";
+import { OllamaAdapter } from "./ollama/adapter.js";
 
 /**
  * Main application class.
@@ -13,11 +15,20 @@ class HostApp {
   private trayMenu: TrayMenu;
   private currentModel = "llama3.2";
   private debugLogsEnabled = false;
+  private logger: Logger;
+  private swarmLogger: Logger;
+  private relayLogger: Logger;
 
   constructor() {
+    // Create loggers for each component
+    this.logger = new Logger("HostApp");
+    this.swarmLogger = new Logger("SwarmServer");
+    this.relayLogger = new Logger("StreamingRelay");
+
     this.relay = new StreamingRelay({
       model: this.currentModel,
       hostName: os.hostname(),
+      logger: this.relayLogger,
     });
 
     this.swarmServer = new SwarmServer({
@@ -27,6 +38,7 @@ class HostApp {
       onDisconnection: (socket) => {
         this.handleDisconnection(socket);
       },
+      logger: this.swarmLogger,
     });
 
     this.trayMenu = new TrayMenu({
@@ -45,7 +57,28 @@ class HostApp {
    */
   async init(): Promise<void> {
     await this.trayMenu.init();
-    this.log("Application initialized");
+    this.logger.log("Application initialized");
+
+    // Perform Ollama health check on startup
+    await this.performHealthCheck();
+  }
+
+  /**
+   * Perform Ollama health check.
+   */
+  private async performHealthCheck(): Promise<void> {
+    this.logger.log("Performing Ollama health check...");
+
+    // Create a temporary OllamaAdapter just for health check
+    const ollamaAdapter = new OllamaAdapter("http://localhost:11434", this.logger);
+    const result = await ollamaAdapter.healthCheck();
+
+    if (!result.healthy) {
+      this.logger.error("Ollama health check failed:", result.error);
+      this.trayMenu.setState("error", "OLLAMA_NOT_FOUND");
+    } else {
+      this.logger.log("Ollama is healthy");
+    }
   }
 
   /**
@@ -53,13 +86,13 @@ class HostApp {
    */
   private async startServer(): Promise<void> {
     try {
-      this.log("Starting server...");
+      this.logger.log("Starting server...");
       const serverId = await this.swarmServer.start();
       this.trayMenu.setServerId(serverId);
       this.trayMenu.setState("ready");
-      this.log(`Server started with ID: ${serverId}`);
+      this.logger.log(`Server started with ID: ${serverId}`);
     } catch (error) {
-      this.log("Failed to start server:", error);
+      this.logger.error("Failed to start server:", error);
       dialog.showErrorBox("Failed to Start Server", String(error));
     }
   }
@@ -69,14 +102,14 @@ class HostApp {
    */
   private async stopServer(): Promise<void> {
     try {
-      this.log("Stopping server...");
+      this.logger.log("Stopping server...");
       await this.swarmServer.stop();
       this.trayMenu.setServerId(null);
       this.trayMenu.setState("stopped");
       this.trayMenu.setClientCount(0);
-      this.log("Server stopped");
+      this.logger.log("Server stopped");
     } catch (error) {
-      this.log("Failed to stop server:", error);
+      this.logger.error("Failed to stop server:", error);
       dialog.showErrorBox("Failed to Stop Server", String(error));
     }
   }
@@ -85,7 +118,7 @@ class HostApp {
    * Handle new client connection.
    */
   private handleConnection(socket: any): void {
-    this.log("Client connected");
+    this.logger.log("Client connected");
     this.relay.handleConnection(socket);
     this.updateClientCount();
     this.updateState();
@@ -95,7 +128,7 @@ class HostApp {
    * Handle client disconnection.
    */
   private handleDisconnection(socket: any): void {
-    this.log("Client disconnected");
+    this.logger.log("Client disconnected");
     this.relay.handleDisconnection(socket);
     this.updateClientCount();
     this.updateState();
@@ -129,7 +162,7 @@ class HostApp {
     this.currentModel = model;
     this.relay.setModel(model);
     this.trayMenu.setModel(model);
-    this.log(`Model selected: ${model}`);
+    this.logger.log(`Model selected: ${model}`);
   }
 
   /**
@@ -139,7 +172,7 @@ class HostApp {
     const serverId = this.swarmServer.getServerId();
     if (serverId) {
       clipboard.writeText(serverId);
-      this.log("Server ID copied to clipboard");
+      this.logger.log("Server ID copied to clipboard");
     }
   }
 
@@ -158,24 +191,25 @@ class HostApp {
    */
   private toggleDebugLogs(): void {
     this.debugLogsEnabled = !this.debugLogsEnabled;
-    this.log(`Debug logs ${this.debugLogsEnabled ? "enabled" : "disabled"}`);
+
+    // Enable/disable all loggers
+    this.logger.setEnabled(this.debugLogsEnabled);
+    this.swarmLogger.setEnabled(this.debugLogsEnabled);
+    this.relayLogger.setEnabled(this.debugLogsEnabled);
+
+    this.logger.log(`Debug logs ${this.debugLogsEnabled ? "enabled" : "disabled"}`);
   }
 
   /**
    * Quit the application.
    */
-  private quit(): void {
-    this.log("Quitting application...");
-    app.quit();
-  }
-
-  /**
-   * Log a message (if debug logs enabled).
-   */
-  private log(...args: any[]): void {
-    if (this.debugLogsEnabled) {
-      console.log("[HostApp]", ...args);
+  private async quit(): Promise<void> {
+    this.logger.log("Quitting application...");
+    // Stop server gracefully before quitting
+    if (this.swarmServer.isRunning()) {
+      await this.stopServer();
     }
+    app.quit();
   }
 
   /**
