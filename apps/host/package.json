@@ -1,0 +1,27 @@
+{
+  "name": "@localllm/host",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc && node dist/index.js",
+    "start": "node dist/index.js",
+    "test": "vitest"
+  },
+  "dependencies": {
+    "@localllm/protocol": "*",
+    "hyperswarm": "^4.8.1",
+    "bs58": "^6.0.0",
+    "menubar": "^9.5.0",
+    "electron": "^33.2.0",
+    "qrcode": "^1.5.4"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.5",
+    "@types/qrcode": "^1.5.5",
+    "typescript": "^5.7.3",
+    "vitest": "^2.1.8"
+  }
+}
