@@ -4,6 +4,7 @@ const Hyperswarm = require('hyperswarm')
 const bs58 = require('bs58')
 
 const MAX_PROMPT_SIZE = 8192
+const SERVER_INFO_TIMEOUT_MS = 15000
 
 let swarm = null
 let discovery = null
@@ -11,6 +12,8 @@ let socket = null
 let inboundBuffer = ''
 let activeRequestId = null
 let closing = false
+let serverInfoTimeoutId = null
+let serverInfoReceived = false
 
 function emit(event) {
   IPC.write(Buffer.from(JSON.stringify(event)))
@@ -30,12 +33,38 @@ function emitError(code, message, requestId) {
   emit(payload)
 }
 
+function clearServerInfoTimeout() {
+  if (serverInfoTimeoutId) {
+    clearTimeout(serverInfoTimeoutId)
+    serverInfoTimeoutId = null
+  }
+}
+
+function startServerInfoTimeout(targetSocket) {
+  clearServerInfoTimeout()
+  serverInfoTimeoutId = setTimeout(async () => {
+    if (socket !== targetSocket || serverInfoReceived) {
+      return
+    }
+
+    emitError('TIMEOUT_NO_RESPONSE', 'No server_info received within 15 seconds')
+    await closeResources()
+    emit({
+      type: 'onDisconnect',
+      code: 'TIMEOUT_NO_RESPONSE',
+      message: 'Connection timed out'
+    })
+  }, SERVER_INFO_TIMEOUT_MS)
+}
+
 async function closeResources() {
   if (closing) {
     return
   }
 
   closing = true
+  clearServerInfoTimeout()
+  serverInfoReceived = false
 
   const previousSocket = socket
   socket = null
@@ -95,6 +124,8 @@ function handleProtocolLine(line) {
       typeof payload.model === 'string' &&
       (payload.status === 'ready' || payload.status === 'busy')
     ) {
+      serverInfoReceived = true
+      clearServerInfoTimeout()
       emit({
         type: 'onServerInfo',
         hostName: payload.host_name,
@@ -197,6 +228,8 @@ function attachSocket(nextSocket) {
   }
 
   socket = nextSocket
+  serverInfoReceived = false
+  startServerInfoTimeout(nextSocket)
 
   nextSocket.on('data', onSocketData)
 
