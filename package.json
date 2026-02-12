@@ -1,0 +1,8 @@
+{
+  "name": "localllm",
+  "private": true,
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ]
+}
