@@ -3,6 +3,7 @@ import { StatusBar } from "expo-status-bar";
 import {
   ActivityIndicator,
   Alert,
+  Animated,
   KeyboardAvoidingView,
   Platform,
   Pressable,
@@ -47,6 +48,7 @@ function parseServerId(raw: string): string | null {
 
 export default function App() {
   const [screen, setScreen] = useState<Screen>("connect");
+  const [displayedScreen, setDisplayedScreen] = useState<Screen>("connect");
   const [connectionState, setConnectionState] = useState<ConnectionState>("disconnected");
   const [connectionError, setConnectionError] = useState<string | null>(null);
   const [lastError, setLastError] = useState<string | null>(null);
@@ -66,7 +68,10 @@ export default function App() {
   const [cameraPermission, requestCameraPermission] = useCameraPermissions();
 
   const transcriptScroll = useRef<ScrollView | null>(null);
+  const promptInputRef = useRef<TextInput | null>(null);
+  const screenOpacity = useRef(new Animated.Value(1)).current;
   const activeAssistant = useRef<{ requestId: string | null; index: number } | null>(null);
+  const lastServerIdRef = useRef<string | null>(null);
   const bridgeRef = useRef<WorkletBridge | null>(null);
   const hostTapCount = useRef(0);
   const hostTapResetTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -207,6 +212,9 @@ export default function App() {
 
         if (event.code !== "USER_DISCONNECTED") {
           setLastError(`${event.code}: ${event.message}`);
+          if (lastServerIdRef.current) {
+            setServerIdInput(lastServerIdRef.current);
+          }
         }
 
         if (event.code === "HOST_DISCONNECTED") {
@@ -228,6 +236,32 @@ export default function App() {
       bridgeRef.current = null;
     };
   }, []);
+
+  useEffect(() => {
+    const shouldAnimateMainScreenTransition =
+      (screen === "connect" || screen === "chat") &&
+      (displayedScreen === "connect" || displayedScreen === "chat") &&
+      screen !== displayedScreen;
+
+    if (!shouldAnimateMainScreenTransition) {
+      setDisplayedScreen(screen);
+      screenOpacity.setValue(1);
+      return;
+    }
+
+    Animated.timing(screenOpacity, {
+      toValue: 0,
+      duration: 130,
+      useNativeDriver: true,
+    }).start(() => {
+      setDisplayedScreen(screen);
+      Animated.timing(screenOpacity, {
+        toValue: 1,
+        duration: 180,
+        useNativeDriver: true,
+      }).start();
+    });
+  }, [displayedScreen, screen, screenOpacity]);
 
   useEffect(() => {
     transcriptScroll.current?.scrollToEnd({ animated: true });
@@ -268,6 +302,7 @@ export default function App() {
     setConnectionError(null);
     setShowDisconnectedBanner(false);
     setLastServerId(parsed);
+    lastServerIdRef.current = parsed;
     setServerIdInput(parsed);
     setScreen("connect");
 
@@ -314,6 +349,9 @@ export default function App() {
     setConnectionError(null);
     setPrompt("");
     bridgeRef.current?.sendPrompt(normalized);
+    requestAnimationFrame(() => {
+      promptInputRef.current?.focus();
+    });
   };
 
   const onAbortPress = () => {
@@ -398,7 +436,7 @@ export default function App() {
         autoCapitalize="none"
         autoCorrect={false}
         editable={connectionState !== "connecting"}
-        style={styles.input}
+        style={[styles.input, styles.connectInput]}
       />
 
       <View style={styles.row}>
@@ -409,13 +447,23 @@ export default function App() {
         >
           <Text style={styles.primaryButtonText}>Connect</Text>
         </Pressable>
-        <Pressable style={[styles.button, styles.secondaryButton]} onPress={openScanner}>
-          <Text style={styles.secondaryButtonText}>Scan QR</Text>
+        <Pressable
+          style={[styles.button, styles.scanButton, connectionState === "connecting" ? styles.disabled : null]}
+          onPress={openScanner}
+          disabled={connectionState === "connecting"}
+        >
+          <Text style={styles.scanButtonText}>Scan QR</Text>
         </Pressable>
       </View>
 
-      {connectionState === "connecting" ? <ActivityIndicator style={styles.loader} /> : null}
-      <Text style={styles.status}>{statusText}</Text>
+      {connectionState === "connecting" ? (
+        <View style={styles.connectingRow}>
+          <ActivityIndicator style={styles.loader} size="small" color="#2448d6" />
+          <Text style={styles.connectingText}>Connecting...</Text>
+        </View>
+      ) : (
+        <Text style={styles.status}>{statusText}</Text>
+      )}
       {connectionError ? <Text style={styles.errorText}>{connectionError}</Text> : null}
     </View>
   );
@@ -438,7 +486,7 @@ export default function App() {
   const renderChatScreen = () => (
     <KeyboardAvoidingView
       style={styles.chatKeyboardContainer}
-      behavior={Platform.OS === "ios" ? "padding" : undefined}
+      behavior={Platform.OS === "ios" ? "padding" : "height"}
       keyboardVerticalOffset={12}
     >
       <View style={styles.screen}>
@@ -518,10 +566,12 @@ export default function App() {
         </ScrollView>
 
         <TextInput
+          ref={promptInputRef}
           value={prompt}
           onChangeText={setPrompt}
-          editable={!isGenerating && connectionState === "connected"}
+          editable={connectionState === "connected"}
           multiline
+          autoFocus
           placeholder="Ask something..."
           style={styles.promptInput}
         />
@@ -590,10 +640,13 @@ export default function App() {
   return (
     <SafeAreaView style={styles.safeArea}>
       <StatusBar style="dark" />
-      {screen === "connect" ? renderConnectScreen() : null}
-      {screen === "scanner" ? renderScannerScreen() : null}
-      {screen === "chat" ? renderChatScreen() : null}
-      {screen === "debug" ? renderDebugScreen() : null}
+      {displayedScreen === "connect" || displayedScreen === "chat" ? (
+        <Animated.View style={[styles.screenTransitionContainer, { opacity: screenOpacity }]}>
+          {displayedScreen === "connect" ? renderConnectScreen() : renderChatScreen()}
+        </Animated.View>
+      ) : null}
+      {displayedScreen === "scanner" ? renderScannerScreen() : null}
+      {displayedScreen === "debug" ? renderDebugScreen() : null}
     </SafeAreaView>
   );
 }
@@ -610,6 +663,9 @@ const styles = StyleSheet.create({
     gap: 12,
   },
   chatKeyboardContainer: {
+    flex: 1,
+  },
+  screenTransitionContainer: {
     flex: 1,
   },
   title: {
@@ -629,6 +685,10 @@ const styles = StyleSheet.create({
     paddingHorizontal: 12,
     paddingVertical: 10,
     backgroundColor: "#ffffff",
+  },
+  connectInput: {
+    borderWidth: 1.5,
+    borderColor: "#b8c4ff",
   },
   promptInput: {
     borderWidth: 1,
@@ -656,6 +716,11 @@ const styles = StyleSheet.create({
   secondaryButton: {
     backgroundColor: "#e3e8ff",
   },
+  scanButton: {
+    backgroundColor: "#f8faff",
+    borderWidth: 1.5,
+    borderColor: "#b8c4ff",
+  },
   disconnectButton: {
     backgroundColor: "#ffe2e8",
   },
@@ -670,6 +735,10 @@ const styles = StyleSheet.create({
     color: "#1d2a63",
     fontWeight: "600",
   },
+  scanButtonText: {
+    color: "#2140be",
+    fontWeight: "700",
+  },
   disconnectButtonText: {
     color: "#8a1434",
     fontWeight: "700",
@@ -683,7 +752,17 @@ const styles = StyleSheet.create({
     fontWeight: "600",
   },
   loader: {
+    marginTop: 0,
+  },
+  connectingRow: {
     marginTop: 8,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+  },
+  connectingText: {
+    color: "#2140be",
+    fontWeight: "700",
   },
   scanner: {
     width: "100%",
