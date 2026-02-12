@@ -39,6 +39,10 @@ function isWorkletEvent(value: unknown): value is WorkletEvent {
       );
     case "onDisconnect":
       return typeof event.code === "string" && typeof event.message === "string";
+    case "onRawMessage":
+      return (
+        (event.direction === "in" || event.direction === "out") && typeof event.text === "string"
+      );
     default:
       return false;
   }

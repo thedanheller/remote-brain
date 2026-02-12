@@ -3,6 +3,8 @@ import { StatusBar } from "expo-status-bar";
 import {
   ActivityIndicator,
   Alert,
+  KeyboardAvoidingView,
+  Platform,
   Pressable,
   SafeAreaView,
   ScrollView,
@@ -17,7 +19,7 @@ import { MAX_PROMPT_SIZE } from "@localllm/protocol";
 import { WorkletBridge } from "./src/services/workletBridge";
 import type { WorkletEvent } from "./src/types/bridge";
 
-type Screen = "connect" | "scanner" | "chat";
+type Screen = "connect" | "scanner" | "chat" | "debug";
 
 type ConnectionState = "disconnected" | "connecting" | "connected";
 
@@ -26,6 +28,8 @@ type TranscriptEntry = {
   text: string;
   aborted?: boolean;
 };
+
+const MAX_DEBUG_LOG_ENTRIES = 300;
 
 function parseServerId(raw: string): string | null {
   const candidate = raw.trim();
@@ -45,6 +49,7 @@ export default function App() {
   const [screen, setScreen] = useState<Screen>("connect");
   const [connectionState, setConnectionState] = useState<ConnectionState>("disconnected");
   const [connectionError, setConnectionError] = useState<string | null>(null);
+  const [lastError, setLastError] = useState<string | null>(null);
   const [serverIdInput, setServerIdInput] = useState("");
   const [lastServerId, setLastServerId] = useState<string | null>(null);
   const [hostName, setHostName] = useState<string | null>(null);
@@ -55,22 +60,43 @@ export default function App() {
   const [showDisconnectedBanner, setShowDisconnectedBanner] = useState(false);
   const [scannerLocked, setScannerLocked] = useState(false);
   const [reconnectCooldownSec, setReconnectCooldownSec] = useState(0);
+  const [requestCount, setRequestCount] = useState(0);
+  const [rawMessageLog, setRawMessageLog] = useState<string[]>([]);
 
   const [cameraPermission, requestCameraPermission] = useCameraPermissions();
 
   const transcriptScroll = useRef<ScrollView | null>(null);
   const activeAssistant = useRef<{ requestId: string | null; index: number } | null>(null);
   const bridgeRef = useRef<WorkletBridge | null>(null);
+  const hostTapCount = useRef(0);
+  const hostTapResetTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const promptLength = prompt.trim().length;
   const promptTooLong = promptLength > MAX_PROMPT_SIZE;
   const isPromptEmpty = promptLength === 0;
+
+  const appendRawMessage = (line: string) => {
+    setRawMessageLog((previous) => {
+      const next = [...previous, line];
+      if (next.length <= MAX_DEBUG_LOG_ENTRIES) {
+        return next;
+      }
+
+      return next.slice(next.length - MAX_DEBUG_LOG_ENTRIES);
+    });
+  };
 
   useEffect(() => {
     const bridge = new WorkletBridge();
     bridgeRef.current = bridge;
 
     bridge.onEvent((event: WorkletEvent) => {
+      if (event.type === "onRawMessage") {
+        const timestamp = new Date().toLocaleTimeString();
+        appendRawMessage(`${timestamp} ${event.direction.toUpperCase()} ${event.text}`);
+        return;
+      }
+
       if (event.type === "onServerInfo") {
         setHostName(event.hostName);
         setModelName(event.model);
@@ -122,9 +148,7 @@ export default function App() {
 
       if (event.type === "onChatEnd") {
         const active = activeAssistant.current;
-        const matchesActiveRequest =
-          !!active &&
-          (active.requestId === event.requestId || active.requestId === null);
+        const matchesActiveRequest = !!active && (active.requestId === event.requestId || active.requestId === null);
 
         if (matchesActiveRequest && event.finishReason === "abort" && active) {
           setTranscript((previous) => {
@@ -148,11 +172,10 @@ export default function App() {
       }
 
       if (event.type === "onError") {
-        if (event.code === "TIMEOUT_NO_RESPONSE") {
-          setConnectionError("Connection timed out");
-        } else {
-          setConnectionError(`${event.code}: ${event.message}`);
-        }
+        const nextError = event.code === "TIMEOUT_NO_RESPONSE" ? "Connection timed out" : `${event.code}: ${event.message}`;
+
+        setConnectionError(nextError);
+        setLastError(nextError);
 
         if (event.requestId && activeAssistant.current?.requestId === event.requestId) {
           setTranscript((previous) => {
@@ -182,6 +205,10 @@ export default function App() {
         setIsGenerating(false);
         activeAssistant.current = null;
 
+        if (event.code !== "USER_DISCONNECTED") {
+          setLastError(`${event.code}: ${event.message}`);
+        }
+
         if (event.code === "HOST_DISCONNECTED") {
           setShowDisconnectedBanner(true);
           setConnectionError(null);
@@ -194,6 +221,9 @@ export default function App() {
     });
 
     return () => {
+      if (hostTapResetTimer.current) {
+        clearTimeout(hostTapResetTimer.current);
+      }
       bridge.destroy();
       bridgeRef.current = null;
     };
@@ -251,8 +281,11 @@ export default function App() {
   const onDisconnectPress = () => {
     bridgeRef.current?.disconnect();
     setConnectionState("disconnected");
+    setConnectionError(null);
+    setShowDisconnectedBanner(false);
     setIsGenerating(false);
     activeAssistant.current = null;
+    setScreen("connect");
   };
 
   const onReconnectPress = () => {
@@ -276,6 +309,7 @@ export default function App() {
       return [...previous, { role: "user", text: normalized }, { role: "assistant", text: "" }];
     });
 
+    setRequestCount((previous) => previous + 1);
     setIsGenerating(true);
     setConnectionError(null);
     setPrompt("");
@@ -295,10 +329,34 @@ export default function App() {
     activeAssistant.current = null;
   };
 
+  const onHostHeaderPress = () => {
+    if (connectionState !== "connected") {
+      return;
+    }
+
+    hostTapCount.current += 1;
+
+    if (hostTapResetTimer.current) {
+      clearTimeout(hostTapResetTimer.current);
+    }
+
+    hostTapResetTimer.current = setTimeout(() => {
+      hostTapCount.current = 0;
+      hostTapResetTimer.current = null;
+    }, 2000);
+
+    if (hostTapCount.current >= 5) {
+      hostTapCount.current = 0;
+      if (hostTapResetTimer.current) {
+        clearTimeout(hostTapResetTimer.current);
+        hostTapResetTimer.current = null;
+      }
+      setScreen("debug");
+    }
+  };
+
   const openScanner = async () => {
-    const permission = cameraPermission?.granted
-      ? cameraPermission
-      : await requestCameraPermission();
+    const permission = cameraPermission?.granted ? cameraPermission : await requestCameraPermission();
 
     if (!permission.granted) {
       Alert.alert("Camera denied", "Camera permission is required for QR scanning.");
@@ -378,100 +436,154 @@ export default function App() {
   );
 
   const renderChatScreen = () => (
-    <View style={styles.screen}>
-      <View style={styles.headerRow}>
-        <View>
-          <Text style={styles.host}>{hostName ?? "Host"}</Text>
-          <Text style={styles.model}>Model: {modelName ?? "-"}</Text>
-        </View>
-        <Pressable style={[styles.button, styles.secondaryButton]} onPress={onDisconnectPress}>
-          <Text style={styles.secondaryButtonText}>Disconnect</Text>
-        </Pressable>
-      </View>
-
-      {showDisconnectedBanner ? (
-        <View style={styles.banner}>
-          <Text style={styles.bannerTitle}>Disconnected</Text>
-          <Pressable
-            style={[
-              styles.button,
-              styles.primaryButton,
-              reconnectCooldownSec > 0 || connectionState === "connecting" ? styles.disabled : null,
-            ]}
-            onPress={onReconnectPress}
-            disabled={reconnectCooldownSec > 0 || connectionState === "connecting"}
-          >
-            <Text style={styles.primaryButtonText}>
-              {reconnectCooldownSec > 0 ? `Reconnect (${reconnectCooldownSec}s)` : "Reconnect"}
-            </Text>
+    <KeyboardAvoidingView
+      style={styles.chatKeyboardContainer}
+      behavior={Platform.OS === "ios" ? "padding" : undefined}
+      keyboardVerticalOffset={12}
+    >
+      <View style={styles.screen}>
+        <View style={styles.chatHeaderBar}>
+          <Pressable style={styles.headerMeta} onPress={onHostHeaderPress}>
+            <Text style={styles.host}>{hostName ?? "Host"}</Text>
+            <Text style={styles.model}>{modelName ?? "-"}</Text>
+          </Pressable>
+          <Pressable style={[styles.button, styles.disconnectButton]} onPress={onDisconnectPress}>
+            <Text style={styles.disconnectButtonText}>Disconnect</Text>
           </Pressable>
         </View>
-      ) : null}
 
-      <ScrollView ref={transcriptScroll} style={styles.transcript} contentContainerStyle={styles.transcriptContent}>
-        {transcript.length === 0 ? <Text style={styles.empty}>No messages yet.</Text> : null}
-        {transcript.map((entry, index) => {
-          const isActiveAssistantMessage =
-            entry.role === "assistant" &&
-            isGenerating &&
-            activeAssistant.current?.index === index;
-          const renderedText =
-            entry.role === "assistant" && entry.aborted
-              ? `${entry.text ? `${entry.text} ` : ""}[Aborted]`
-              : entry.text;
+        {showDisconnectedBanner ? (
+          <View style={styles.banner}>
+            <Text style={styles.bannerTitle}>Disconnected</Text>
+            <Pressable
+              style={[
+                styles.button,
+                styles.primaryButton,
+                reconnectCooldownSec > 0 || connectionState === "connecting" ? styles.disabled : null,
+              ]}
+              onPress={onReconnectPress}
+              disabled={reconnectCooldownSec > 0 || connectionState === "connecting"}
+            >
+              <Text style={styles.primaryButtonText}>
+                {reconnectCooldownSec > 0 ? `Reconnect (${reconnectCooldownSec}s)` : "Reconnect"}
+              </Text>
+            </Pressable>
+          </View>
+        ) : null}
 
-          return (
-            <View key={`${entry.role}-${index}`} style={styles.message}>
-              <Text style={styles.messageRole}>{entry.role.toUpperCase()}</Text>
-              <View style={styles.messageBody}>
-                {renderedText ? <Text style={styles.messageText}>{renderedText}</Text> : null}
-                {isActiveAssistantMessage ? (
-                  <ActivityIndicator size="small" color="#4b578f" />
-                ) : null}
-                {!renderedText && !isActiveAssistantMessage ? (
-                  <Text style={styles.messageText}>...</Text>
-                ) : null}
+        <ScrollView
+          ref={transcriptScroll}
+          style={styles.transcript}
+          contentContainerStyle={[
+            styles.transcriptContent,
+            transcript.length === 0 ? styles.transcriptEmptyContent : null,
+          ]}
+          keyboardShouldPersistTaps="handled"
+        >
+          {transcript.length === 0 ? (
+            <Text style={styles.empty}>Connected to {hostName ?? "host"}. Ask anything.</Text>
+          ) : null}
+
+          {transcript.map((entry, index) => {
+            const isActiveAssistantMessage =
+              entry.role === "assistant" && isGenerating && activeAssistant.current?.index === index;
+            const renderedText =
+              entry.role === "assistant" && entry.aborted ? `${entry.text ? `${entry.text} ` : ""}[Aborted]` : entry.text;
+
+            return (
+              <View
+                key={`${entry.role}-${index}`}
+                style={[
+                  styles.messageRow,
+                  entry.role === "user" ? styles.userMessageRow : styles.assistantMessageRow,
+                ]}
+              >
+                <View
+                  style={[
+                    styles.messageBubble,
+                    entry.role === "user" ? styles.userBubble : styles.assistantBubble,
+                  ]}
+                >
+                  {renderedText ? (
+                    <Text style={[styles.messageText, entry.role === "user" ? styles.userMessageText : null]}>
+                      {renderedText}
+                    </Text>
+                  ) : null}
+                  {isActiveAssistantMessage ? <ActivityIndicator size="small" color="#2d3d7a" /> : null}
+                  {!renderedText && !isActiveAssistantMessage ? <Text style={styles.messageText}>...</Text> : null}
+                </View>
               </View>
-            </View>
-          );
-        })}
-      </ScrollView>
+            );
+          })}
+        </ScrollView>
 
-      <TextInput
-        value={prompt}
-        onChangeText={setPrompt}
-        editable={!isGenerating && connectionState === "connected"}
-        multiline
-        placeholder="Ask something..."
-        style={styles.promptInput}
-      />
+        <TextInput
+          value={prompt}
+          onChangeText={setPrompt}
+          editable={!isGenerating && connectionState === "connected"}
+          multiline
+          placeholder="Ask something..."
+          style={styles.promptInput}
+        />
 
-      {promptTooLong ? (
-        <Text style={styles.errorText}>
-          Prompt exceeds {MAX_PROMPT_SIZE} characters. Shorten it to send.
-        </Text>
-      ) : null}
-      {connectionError ? <Text style={styles.errorText}>{connectionError}</Text> : null}
+        {promptTooLong ? (
+          <Text style={styles.errorText}>Prompt exceeds {MAX_PROMPT_SIZE} characters. Shorten it to send.</Text>
+        ) : null}
+        {connectionError ? <Text style={styles.errorText}>{connectionError}</Text> : null}
 
-      <View style={styles.row}>
-        <Pressable
-          style={[styles.button, styles.primaryButton, sendDisabled ? styles.disabled : null]}
-          onPress={onSendPrompt}
-          disabled={sendDisabled}
-        >
-          <Text style={styles.primaryButtonText}>Send</Text>
-        </Pressable>
-        <Pressable
-          style={[styles.button, styles.secondaryButton, !isGenerating ? styles.disabled : null]}
-          onPress={onAbortPress}
-          disabled={!isGenerating}
-        >
-          <Text style={styles.secondaryButtonText}>Stop</Text>
-        </Pressable>
-        <Pressable style={[styles.button, styles.secondaryButton]} onPress={onClearPress}>
-          <Text style={styles.secondaryButtonText}>Clear</Text>
-        </Pressable>
+        <View style={styles.row}>
+          <Pressable
+            style={[styles.button, styles.primaryButton, sendDisabled ? styles.disabled : null]}
+            onPress={onSendPrompt}
+            disabled={sendDisabled}
+          >
+            <Text style={styles.primaryButtonText}>Send</Text>
+          </Pressable>
+          <Pressable
+            style={[styles.button, styles.secondaryButton, !isGenerating ? styles.disabled : null]}
+            onPress={onAbortPress}
+            disabled={!isGenerating}
+          >
+            <Text style={styles.secondaryButtonText}>Stop</Text>
+          </Pressable>
+          <Pressable style={[styles.button, styles.secondaryButton]} onPress={onClearPress}>
+            <Text style={styles.secondaryButtonText}>Clear</Text>
+          </Pressable>
+        </View>
       </View>
+    </KeyboardAvoidingView>
+  );
+
+  const renderDebugScreen = () => (
+    <View style={styles.screen}>
+      <Text style={styles.title}>Client Debug</Text>
+
+      <View style={styles.debugCard}>
+        <Text style={styles.debugRow}>Connection: {connectionState}</Text>
+        <Text style={styles.debugRow}>Server ID: {lastServerId ?? "-"}</Text>
+        <Text style={styles.debugRow}>Request count: {requestCount}</Text>
+        <Text style={styles.debugRow}>Last error: {lastError ?? "None"}</Text>
+      </View>
+
+      <View style={styles.debugLogCard}>
+        <Text style={styles.label}>Raw Message Log</Text>
+        <ScrollView
+          style={styles.debugLog}
+          contentContainerStyle={styles.debugLogContent}
+          keyboardShouldPersistTaps="handled"
+        >
+          {rawMessageLog.length === 0 ? <Text style={styles.empty}>No raw messages yet.</Text> : null}
+          {rawMessageLog.map((entry, index) => (
+            <Text key={`${index}-${entry.slice(0, 12)}`} style={styles.debugLogLine}>
+              {entry}
+            </Text>
+          ))}
+        </ScrollView>
+      </View>
+
+      <Pressable style={[styles.button, styles.primaryButton]} onPress={() => setScreen("chat")}>
+        <Text style={styles.primaryButtonText}>Close</Text>
+      </Pressable>
     </View>
   );
 
@@ -481,6 +593,7 @@ export default function App() {
       {screen === "connect" ? renderConnectScreen() : null}
       {screen === "scanner" ? renderScannerScreen() : null}
       {screen === "chat" ? renderChatScreen() : null}
+      {screen === "debug" ? renderDebugScreen() : null}
     </SafeAreaView>
   );
 }
@@ -495,6 +608,9 @@ const styles = StyleSheet.create({
     paddingHorizontal: 16,
     paddingVertical: 20,
     gap: 12,
+  },
+  chatKeyboardContainer: {
+    flex: 1,
   },
   title: {
     fontSize: 28,
@@ -529,11 +645,6 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     gap: 8,
   },
-  headerRow: {
-    flexDirection: "row",
-    justifyContent: "space-between",
-    alignItems: "center",
-  },
   button: {
     borderRadius: 10,
     paddingVertical: 11,
@@ -545,6 +656,9 @@ const styles = StyleSheet.create({
   secondaryButton: {
     backgroundColor: "#e3e8ff",
   },
+  disconnectButton: {
+    backgroundColor: "#ffe2e8",
+  },
   disabled: {
     opacity: 0.5,
   },
@@ -555,6 +669,10 @@ const styles = StyleSheet.create({
   secondaryButtonText: {
     color: "#1d2a63",
     fontWeight: "600",
+  },
+  disconnectButtonText: {
+    color: "#8a1434",
+    fontWeight: "700",
   },
   status: {
     fontWeight: "600",
@@ -572,6 +690,21 @@ const styles = StyleSheet.create({
     aspectRatio: 1,
     borderRadius: 14,
     overflow: "hidden",
+  },
+  chatHeaderBar: {
+    borderWidth: 1,
+    borderColor: "#cdd5fb",
+    backgroundColor: "#eef2ff",
+    borderRadius: 12,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    gap: 8,
+  },
+  headerMeta: {
+    flex: 1,
   },
   host: {
     fontSize: 18,
@@ -607,29 +740,81 @@ const styles = StyleSheet.create({
     padding: 12,
     gap: 8,
   },
+  transcriptEmptyContent: {
+    flexGrow: 1,
+    justifyContent: "center",
+    alignItems: "center",
+  },
   empty: {
     color: "#5f6899",
+    textAlign: "center",
+    fontWeight: "600",
   },
-  message: {
-    padding: 10,
-    borderRadius: 10,
+  messageRow: {
+    width: "100%",
+  },
+  userMessageRow: {
+    alignItems: "flex-end",
+  },
+  assistantMessageRow: {
+    alignItems: "flex-start",
+  },
+  messageBubble: {
+    maxWidth: "85%",
+    borderRadius: 12,
     borderWidth: 1,
-    borderColor: "#e0e6ff",
-    backgroundColor: "#f8f9ff",
-    gap: 4,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    gap: 8,
   },
-  messageRole: {
-    fontSize: 11,
-    fontWeight: "700",
-    color: "#4b578f",
+  userBubble: {
+    backgroundColor: "#2448d6",
+    borderColor: "#2448d6",
+  },
+  assistantBubble: {
+    backgroundColor: "#f2f5ff",
+    borderColor: "#dbe4ff",
   },
   messageText: {
     color: "#1b1f3a",
     lineHeight: 20,
   },
-  messageBody: {
-    flexDirection: "row",
-    alignItems: "center",
+  userMessageText: {
+    color: "#ffffff",
+  },
+  debugCard: {
+    borderWidth: 1,
+    borderColor: "#d2d8f2",
+    borderRadius: 10,
+    backgroundColor: "#ffffff",
+    padding: 12,
     gap: 8,
+  },
+  debugRow: {
+    color: "#1f2751",
+    fontWeight: "500",
+  },
+  debugLogCard: {
+    flex: 1,
+    borderWidth: 1,
+    borderColor: "#d2d8f2",
+    borderRadius: 10,
+    backgroundColor: "#ffffff",
+    padding: 12,
+    gap: 8,
+  },
+  debugLog: {
+    flex: 1,
+    borderRadius: 8,
+    backgroundColor: "#0f1221",
+  },
+  debugLogContent: {
+    padding: 10,
+    gap: 6,
+  },
+  debugLogLine: {
+    color: "#d7e0ff",
+    fontFamily: Platform.OS === "ios" ? "Menlo" : "monospace",
+    fontSize: 12,
   },
 });

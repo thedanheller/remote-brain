@@ -33,6 +33,14 @@ function emitError(code, message, requestId) {
   emit(payload)
 }
 
+function emitRawMessage(direction, text) {
+  emit({
+    type: 'onRawMessage',
+    direction,
+    text
+  })
+}
+
 function clearServerInfoTimeout() {
   if (serverInfoTimeoutId) {
     clearTimeout(serverInfoTimeoutId)
@@ -103,6 +111,8 @@ function nextRequestId() {
 }
 
 function handleProtocolLine(line) {
+  emitRawMessage('in', line)
+
   let message
   try {
     message = JSON.parse(line)
@@ -335,6 +345,7 @@ function handleSendPrompt(prompt) {
   }) + '\n'
 
   try {
+    emitRawMessage('out', message.trim())
     socket.write(message)
     activeRequestId = requestId
   } catch {
@@ -354,6 +365,7 @@ function handleAbort() {
   }) + '\n'
 
   try {
+    emitRawMessage('out', message.trim())
     socket.write(message)
   } catch {
     emitError('HOST_DISCONNECTED', 'Failed to send abort', requestId)
