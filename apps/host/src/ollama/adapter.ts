@@ -1,4 +1,4 @@
-import { ErrorCode, type ErrorCodeValue } from "@localllm/protocol";
+import { ErrorCode, type ErrorCodeValue, LIMITS } from "@localllm/protocol";
 import { Logger } from "../utils/logger.js";
 
 export interface OllamaGenerateRequest {
@@ -29,8 +29,6 @@ export interface StreamCallbacks {
   onEnd: () => void;
   onError: (code: ErrorCodeValue, message: string) => void;
 }
-
-const CHUNK_TIMEOUT_MS = 30_000;
 
 /**
  * Adapter for streaming inference from local Ollama API.
@@ -101,9 +99,9 @@ export class OllamaAdapter {
       const resetChunkTimer = () => {
         if (chunkTimer) clearTimeout(chunkTimer);
         chunkTimer = setTimeout(() => {
-          this.logger.warn(`Request ${requestId} timed out: no chunk for ${CHUNK_TIMEOUT_MS / 1000}s`);
+          this.logger.warn(`Request ${requestId} timed out: no chunk for ${LIMITS.CLIENT_TIMEOUT_MS / 1000}s`);
           abortController.abort();
-        }, CHUNK_TIMEOUT_MS);
+        }, LIMITS.CLIENT_TIMEOUT_MS);
       };
 
       // Start the initial chunk timer
