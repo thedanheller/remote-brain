@@ -22,6 +22,8 @@ export interface RelayConfig {
   logger?: Logger;
 }
 
+const SERVER_INFO_TIMEOUT_MS = 5_000;
+
 /**
  * Streaming relay that connects clients to the Ollama inference engine.
  */
@@ -70,7 +72,8 @@ export class StreamingRelay {
   }
 
   /**
-   * Send server_info message to a client.
+   * Send server_info message to a client with a delivery timeout.
+   * If the write doesn't flush within 5 seconds, close the socket.
    */
   private sendServerInfo(socket: Duplex): void {
     const message: ServerInfoMessage = {
@@ -81,7 +84,19 @@ export class StreamingRelay {
         status: this.gate.isBusy() ? "busy" : "ready",
       },
     };
-    socket.write(encode(message));
+
+    let delivered = false;
+    const timeout = setTimeout(() => {
+      if (!delivered) {
+        this.logger.warn("server_info not delivered within 5s, closing socket");
+        socket.destroy();
+      }
+    }, SERVER_INFO_TIMEOUT_MS);
+
+    socket.write(encode(message), () => {
+      delivered = true;
+      clearTimeout(timeout);
+    });
   }
 
   /**

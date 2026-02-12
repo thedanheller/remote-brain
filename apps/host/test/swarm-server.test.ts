@@ -90,6 +90,55 @@ describe("SwarmServer", () => {
     await expect(swarmServer.stop()).resolves.not.toThrow();
   });
 
+  it("should reject connections when max clients (5) reached", async () => {
+    await swarmServer.start();
+
+    const connectionHandler = mockSwarm.on.mock.calls.find(
+      (call) => call[0] === "connection"
+    )?.[1];
+
+    expect(connectionHandler).toBeDefined();
+
+    // Fill up to max capacity (5 clients)
+    const sockets: any[] = [];
+    for (let i = 0; i < 5; i++) {
+      const socket = {
+        destroy: vi.fn(),
+        end: vi.fn(),
+        write: vi.fn(),
+        on: vi.fn(),
+      } as any;
+      sockets.push(socket);
+      connectionHandler(socket);
+    }
+
+    expect(swarmServer.getClientCount()).toBe(5);
+    expect(onConnectionSpy).toHaveBeenCalledTimes(5);
+
+    // 6th connection should be rejected
+    const rejectedSocket = {
+      destroy: vi.fn(),
+      end: vi.fn(),
+      write: vi.fn(),
+      on: vi.fn(),
+    } as any;
+
+    connectionHandler(rejectedSocket);
+
+    // Should NOT be added to connected sockets
+    expect(swarmServer.getClientCount()).toBe(5);
+    // Should NOT trigger onConnection callback
+    expect(onConnectionSpy).toHaveBeenCalledTimes(5);
+    // Should send error and close
+    expect(rejectedSocket.write).toHaveBeenCalled();
+    const writtenData = rejectedSocket.write.mock.calls[0][0];
+    const parsed = JSON.parse(writtenData);
+    expect(parsed.type).toBe("error");
+    expect(parsed.payload.code).toBe("CONNECT_FAILED");
+    expect(parsed.payload.message).toBe("Max clients reached");
+    expect(rejectedSocket.end).toHaveBeenCalled();
+  });
+
   it("should track connected clients", async () => {
     await swarmServer.start();
 

@@ -30,6 +30,8 @@ export interface StreamCallbacks {
   onError: (code: ErrorCodeValue, message: string) => void;
 }
 
+const CHUNK_TIMEOUT_MS = 30_000;
+
 /**
  * Adapter for streaming inference from local Ollama API.
  */
@@ -94,54 +96,84 @@ export class OllamaAdapter {
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
+      let chunkTimer: ReturnType<typeof setTimeout> | null = null;
 
-      while (true) {
-        const { done, value } = await reader.read();
+      const resetChunkTimer = () => {
+        if (chunkTimer) clearTimeout(chunkTimer);
+        chunkTimer = setTimeout(() => {
+          this.logger.warn(`Request ${requestId} timed out: no chunk for ${CHUNK_TIMEOUT_MS / 1000}s`);
+          abortController.abort();
+        }, CHUNK_TIMEOUT_MS);
+      };
 
-        if (done) {
-          break;
-        }
+      // Start the initial chunk timer
+      resetChunkTimer();
 
-        buffer += decoder.decode(value, { stream: true });
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
 
-        // Process complete lines
-        let newlineIndex: number;
-        while ((newlineIndex = buffer.indexOf("\n")) !== -1) {
-          const line = buffer.slice(0, newlineIndex);
-          buffer = buffer.slice(newlineIndex + 1);
+          if (done) {
+            break;
+          }
 
-          if (line.length === 0) continue;
+          // Reset timer on every network read
+          resetChunkTimer();
 
-          try {
-            const chunk: OllamaChunk = JSON.parse(line);
+          buffer += decoder.decode(value, { stream: true });
 
-            if (chunk.response) {
-              callbacks.onChunk(chunk.response);
+          // Process complete lines
+          let newlineIndex: number;
+          while ((newlineIndex = buffer.indexOf("\n")) !== -1) {
+            const line = buffer.slice(0, newlineIndex);
+            buffer = buffer.slice(newlineIndex + 1);
+
+            if (line.length === 0) continue;
+
+            try {
+              const chunk: OllamaChunk = JSON.parse(line);
+
+              if (chunk.response) {
+                callbacks.onChunk(chunk.response);
+              }
+
+              if (chunk.done) {
+                this.logger.log(`Generation completed for request ${requestId}`);
+                if (chunkTimer) clearTimeout(chunkTimer);
+                callbacks.onEnd();
+                this.abortControllers.delete(requestId);
+                return;
+              }
+            } catch (error) {
+              console.error("Failed to parse Ollama chunk:", error);
             }
-
-            if (chunk.done) {
-              this.logger.log(`Generation completed for request ${requestId}`);
-              callbacks.onEnd();
-              this.abortControllers.delete(requestId);
-              return;
-            }
-          } catch (error) {
-            console.error("Failed to parse Ollama chunk:", error);
           }
         }
+
+        if (chunkTimer) clearTimeout(chunkTimer);
+        callbacks.onEnd();
+        this.abortControllers.delete(requestId);
+      } catch (innerError) {
+        if (chunkTimer) clearTimeout(chunkTimer);
+        throw innerError;
       }
-
-      callbacks.onEnd();
-      this.abortControllers.delete(requestId);
     } catch (error) {
-      this.abortControllers.delete(requestId);
-
       if (error instanceof Error) {
         if (error.name === "AbortError") {
-          callbacks.onError(ErrorCode.GENERATION_ABORTED, "Generation was aborted");
+          // Distinguish timeout-triggered abort from user-initiated abort.
+          // User-initiated abort() deletes the controller from the map first,
+          // while timeout-triggered abort leaves it in place.
+          const wasTimeout = this.abortControllers.has(requestId);
+          this.abortControllers.delete(requestId);
+          if (wasTimeout) {
+            callbacks.onError(ErrorCode.TIMEOUT_NO_RESPONSE, "No response from model for 30 seconds");
+          } else {
+            callbacks.onError(ErrorCode.GENERATION_ABORTED, "Generation was aborted");
+          }
           return;
         }
 
+        this.abortControllers.delete(requestId);
         if (error.message.includes("ECONNREFUSED")) {
           callbacks.onError(ErrorCode.OLLAMA_NOT_FOUND, "Cannot connect to Ollama (not running?)");
           return;
@@ -149,6 +181,7 @@ export class OllamaAdapter {
 
         callbacks.onError(ErrorCode.GENERATION_FAILED, error.message);
       } else {
+        this.abortControllers.delete(requestId);
         callbacks.onError(ErrorCode.GENERATION_FAILED, "Unknown error during generation");
       }
     }

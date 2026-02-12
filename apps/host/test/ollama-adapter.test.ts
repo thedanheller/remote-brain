@@ -207,6 +207,65 @@ describe("OllamaAdapter", () => {
     expect(chunks).toEqual(["valid", "!"]);
   });
 
+  it("should timeout with TIMEOUT_NO_RESPONSE when no chunks arrive", async () => {
+    vi.useFakeTimers();
+    let errorCode: string | null = null;
+    let errorMessage: string | null = null;
+
+    // Capture the abort signal so our mock reader can reject when aborted
+    let capturedSignal: AbortSignal | null = null;
+
+    const mockResponse = {
+      ok: true,
+      body: {
+        getReader: () => ({
+          read: vi.fn().mockImplementation(() => {
+            return new Promise((resolve, reject) => {
+              if (capturedSignal?.aborted) {
+                const err = new Error("The operation was aborted");
+                err.name = "AbortError";
+                reject(err);
+                return;
+              }
+              capturedSignal?.addEventListener("abort", () => {
+                const err = new Error("The operation was aborted");
+                err.name = "AbortError";
+                reject(err);
+              });
+            });
+          }),
+        }),
+      },
+    };
+
+    global.fetch = vi.fn().mockImplementation((_url: string, opts: any) => {
+      capturedSignal = opts?.signal || null;
+      return Promise.resolve(mockResponse);
+    });
+
+    const generatePromise = adapter.generate("req-timeout", "llama3.2", "test prompt", {
+      onChunk: () => {},
+      onEnd: () => {},
+      onError: (code, message) => {
+        errorCode = code;
+        errorMessage = message;
+      },
+    });
+
+    // Let fetch resolve
+    await vi.advanceTimersByTimeAsync(0);
+
+    // Advance past 30s — the chunk timer fires abortController.abort()
+    await vi.advanceTimersByTimeAsync(30_000);
+
+    await generatePromise;
+
+    expect(errorCode).toBe(ErrorCode.TIMEOUT_NO_RESPONSE);
+    expect(errorMessage).toContain("30 seconds");
+
+    vi.useRealTimers();
+  });
+
   it("should pass health check when Ollama is reachable", async () => {
     const mockResponse = {
       ok: true,
