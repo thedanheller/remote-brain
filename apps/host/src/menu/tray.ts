@@ -1,4 +1,4 @@
-import { app, Menu, Tray, clipboard, nativeImage } from "electron";
+import { app, Menu, Tray, clipboard, nativeImage, BrowserWindow } from "electron";
 import QRCode from "qrcode";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -6,7 +6,7 @@ import { fileURLToPath } from "url";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-export type AppState = "stopped" | "ready" | "busy";
+export type AppState = "stopped" | "ready" | "busy" | "error";
 
 export interface MenuCallbacks {
   onStartServer: () => Promise<void>;
@@ -15,7 +15,7 @@ export interface MenuCallbacks {
   onCopyServerId: () => void;
   onShowQR: () => Promise<void>;
   onToggleDebugLogs: () => void;
-  onQuit: () => void;
+  onQuit: () => Promise<void>;
 }
 
 /**
@@ -29,6 +29,8 @@ export class TrayMenu {
   private currentModel = "llama3.2";
   private debugLogsEnabled = false;
   private callbacks: MenuCallbacks;
+  private qrWindow: BrowserWindow | null = null;
+  private errorMessage: string | null = null;
 
   constructor(callbacks: MenuCallbacks) {
     this.callbacks = callbacks;
@@ -49,8 +51,9 @@ export class TrayMenu {
   /**
    * Update the application state.
    */
-  setState(state: AppState): void {
+  setState(state: AppState, errorMessage?: string): void {
     this.state = state;
+    this.errorMessage = errorMessage || null;
     this.updateMenu();
     this.updateTooltip();
   }
@@ -94,12 +97,21 @@ export class TrayMenu {
       enabled: false,
     });
 
+    // Show error message if in error state
+    if (this.state === "error" && this.errorMessage) {
+      template.push({
+        label: this.errorMessage,
+        enabled: false,
+      });
+    }
+
     template.push({ type: "separator" });
 
     // Server controls
-    if (this.state === "stopped") {
+    if (this.state === "stopped" || this.state === "error") {
       template.push({
         label: "Start Server",
+        enabled: this.state !== "error",
         click: () => this.callbacks.onStartServer(),
       });
     } else {
@@ -197,7 +209,7 @@ export class TrayMenu {
   }
 
   /**
-   * Show QR code in a dialog.
+   * Show QR code in a window.
    */
   async showQRCode(serverId: string): Promise<void> {
     try {
@@ -206,12 +218,98 @@ export class TrayMenu {
         margin: 2,
       });
 
-      // For simplicity, just copy the QR data URL to clipboard
-      // In a full implementation, you'd show this in a window
-      console.log("QR Code generated. In a full implementation, this would open a window.");
-      console.log("Server ID:", serverId);
+      // Close existing QR window if open
+      if (this.qrWindow && !this.qrWindow.isDestroyed()) {
+        this.qrWindow.close();
+      }
+
+      // Create new window
+      this.qrWindow = new BrowserWindow({
+        width: 500,
+        height: 600,
+        resizable: false,
+        title: "Server QR Code",
+        webPreferences: {
+          nodeIntegration: false,
+          contextIsolation: true,
+        },
+      });
+
+      // Generate HTML content
+      const html = `
+        <!DOCTYPE html>
+        <html>
+          <head>
+            <meta charset="UTF-8">
+            <title>Server QR Code</title>
+            <style>
+              body {
+                margin: 0;
+                padding: 20px;
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                justify-content: center;
+                min-height: 100vh;
+                background: #f5f5f5;
+              }
+              .container {
+                background: white;
+                border-radius: 12px;
+                padding: 30px;
+                box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+                text-align: center;
+              }
+              h1 {
+                margin: 0 0 20px 0;
+                font-size: 24px;
+                color: #333;
+              }
+              .qr-code {
+                margin: 20px 0;
+              }
+              .server-id {
+                margin: 20px 0;
+                padding: 10px;
+                background: #f5f5f5;
+                border-radius: 6px;
+                font-family: monospace;
+                font-size: 12px;
+                word-break: break-all;
+                color: #666;
+              }
+              .instructions {
+                margin-top: 20px;
+                font-size: 14px;
+                color: #666;
+              }
+            </style>
+          </head>
+          <body>
+            <div class="container">
+              <h1>LocalLLM Server</h1>
+              <div class="qr-code">
+                <img src="${qrDataUrl}" alt="QR Code" />
+              </div>
+              <div class="server-id">${serverId}</div>
+              <div class="instructions">
+                Scan this QR code or copy the Server ID to connect from your client device.
+              </div>
+            </div>
+          </body>
+        </html>
+      `;
+
+      // Load HTML content
+      await this.qrWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`);
+
+      // Clean up reference when window is closed
+      this.qrWindow.on("closed", () => {
+        this.qrWindow = null;
+      });
     } catch (error) {
-      console.error("Failed to generate QR code:", error);
+      console.error("Failed to show QR code:", error);
     }
   }
 
@@ -219,6 +317,10 @@ export class TrayMenu {
    * Destroy the tray.
    */
   destroy(): void {
+    if (this.qrWindow && !this.qrWindow.isDestroyed()) {
+      this.qrWindow.close();
+      this.qrWindow = null;
+    }
     if (this.tray) {
       this.tray.destroy();
       this.tray = null;

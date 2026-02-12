@@ -206,4 +206,45 @@ describe("OllamaAdapter", () => {
     // Should skip invalid JSON and process valid chunks
     expect(chunks).toEqual(["valid", "!"]);
   });
+
+  it("should pass health check when Ollama is reachable", async () => {
+    const mockResponse = {
+      ok: true,
+      json: async () => ({ models: [] }),
+    };
+
+    global.fetch = vi.fn().mockResolvedValue(mockResponse);
+
+    const result = await adapter.healthCheck();
+
+    expect(result.healthy).toBe(true);
+    expect(result.error).toBeUndefined();
+    expect(global.fetch).toHaveBeenCalledWith(
+      "http://localhost:11434/api/tags",
+      expect.objectContaining({ method: "GET" })
+    );
+  });
+
+  it("should fail health check when Ollama is not reachable", async () => {
+    global.fetch = vi.fn().mockRejectedValue(new Error("fetch failed: ECONNREFUSED"));
+
+    const result = await adapter.healthCheck();
+
+    expect(result.healthy).toBe(false);
+    expect(result.error).toBe("Cannot connect to Ollama (not running?)");
+  });
+
+  it("should fail health check when Ollama returns error status", async () => {
+    const mockResponse = {
+      ok: false,
+      status: 500,
+    };
+
+    global.fetch = vi.fn().mockResolvedValue(mockResponse);
+
+    const result = await adapter.healthCheck();
+
+    expect(result.healthy).toBe(false);
+    expect(result.error).toContain("HTTP 500");
+  });
 });

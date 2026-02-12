@@ -2,10 +2,12 @@ import Hyperswarm from "hyperswarm";
 import bs58 from "bs58";
 import crypto from "crypto";
 import type { Duplex } from "stream";
+import { Logger } from "../utils/logger.js";
 
 export interface SwarmServerConfig {
   onConnection: (socket: Duplex) => void;
   onDisconnection: (socket: Duplex) => void;
+  logger?: Logger;
 }
 
 /**
@@ -17,9 +19,11 @@ export class SwarmServer {
   private serverId: string | null = null;
   private connectedSockets = new Set<Duplex>();
   private config: SwarmServerConfig;
+  private logger: Logger;
 
   constructor(config: SwarmServerConfig) {
     this.config = config;
+    this.logger = config.logger || new Logger("SwarmServer");
   }
 
   /**
@@ -34,6 +38,8 @@ export class SwarmServer {
     this.topic = crypto.randomBytes(32);
     this.serverId = bs58.encode(this.topic);
 
+    this.logger.log(`Starting Hyperswarm server with ID: ${this.serverId}`);
+
     // Create Hyperswarm instance
     this.swarm = new Hyperswarm();
 
@@ -41,18 +47,22 @@ export class SwarmServer {
     const discovery = this.swarm.join(this.topic, { server: true, client: false });
     await discovery.flushed();
 
+    this.logger.log("Server joined topic and flushed");
+
     // Handle connections
     this.swarm.on("connection", (socket: Duplex) => {
+      this.logger.log("New peer connection established");
       this.connectedSockets.add(socket);
       this.config.onConnection(socket);
 
       socket.on("close", () => {
+        this.logger.log("Peer connection closed");
         this.connectedSockets.delete(socket);
         this.config.onDisconnection(socket);
       });
 
       socket.on("error", (error) => {
-        console.error("Socket error:", error);
+        this.logger.error("Socket error:", error);
         this.connectedSockets.delete(socket);
         this.config.onDisconnection(socket);
       });
@@ -69,7 +79,10 @@ export class SwarmServer {
       return;
     }
 
+    this.logger.log("Stopping Hyperswarm server...");
+
     // Close all connected sockets
+    this.logger.log(`Closing ${this.connectedSockets.size} connected socket(s)`);
     for (const socket of this.connectedSockets) {
       socket.destroy();
     }
@@ -77,14 +90,18 @@ export class SwarmServer {
 
     // Leave the topic
     if (this.topic) {
+      this.logger.log("Leaving Hyperswarm topic");
       this.swarm.leave(this.topic);
     }
 
     // Destroy the swarm
+    this.logger.log("Destroying Hyperswarm instance");
     await this.swarm.destroy();
     this.swarm = null;
     this.topic = null;
     this.serverId = null;
+
+    this.logger.log("Server stopped successfully");
   }
 
   /**
