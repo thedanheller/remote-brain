@@ -24,6 +24,7 @@ type ConnectionState = "disconnected" | "connecting" | "connected";
 type TranscriptEntry = {
   role: "user" | "assistant";
   text: string;
+  aborted?: boolean;
 };
 
 function parseServerId(raw: string): string | null {
@@ -53,6 +54,7 @@ export default function App() {
   const [isGenerating, setIsGenerating] = useState(false);
   const [showDisconnectedBanner, setShowDisconnectedBanner] = useState(false);
   const [scannerLocked, setScannerLocked] = useState(false);
+  const [reconnectCooldownSec, setReconnectCooldownSec] = useState(0);
 
   const [cameraPermission, requestCameraPermission] = useCameraPermissions();
 
@@ -119,7 +121,26 @@ export default function App() {
       }
 
       if (event.type === "onChatEnd") {
-        if (activeAssistant.current?.requestId === event.requestId) {
+        const active = activeAssistant.current;
+        const matchesActiveRequest =
+          !!active &&
+          (active.requestId === event.requestId || active.requestId === null);
+
+        if (matchesActiveRequest && event.finishReason === "abort" && active) {
+          setTranscript((previous) => {
+            const next = [...previous];
+            const target = next[active.index];
+            if (target && target.role === "assistant") {
+              next[active.index] = {
+                ...target,
+                aborted: true,
+              };
+            }
+            return next;
+          });
+        }
+
+        if (matchesActiveRequest) {
           activeAssistant.current = null;
         }
         setIsGenerating(false);
@@ -127,7 +148,11 @@ export default function App() {
       }
 
       if (event.type === "onError") {
-        setConnectionError(`${event.code}: ${event.message}`);
+        if (event.code === "TIMEOUT_NO_RESPONSE") {
+          setConnectionError("Connection timed out");
+        } else {
+          setConnectionError(`${event.code}: ${event.message}`);
+        }
 
         if (event.requestId && activeAssistant.current?.requestId === event.requestId) {
           setTranscript((previous) => {
@@ -178,6 +203,18 @@ export default function App() {
     transcriptScroll.current?.scrollToEnd({ animated: true });
   }, [transcript]);
 
+  useEffect(() => {
+    if (reconnectCooldownSec <= 0) {
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      setReconnectCooldownSec((previous) => Math.max(0, previous - 1));
+    }, 1000);
+
+    return () => clearTimeout(timer);
+  }, [reconnectCooldownSec]);
+
   const statusText = useMemo(() => {
     if (connectionState === "connecting") {
       return "Connecting...";
@@ -219,10 +256,11 @@ export default function App() {
   };
 
   const onReconnectPress = () => {
-    if (!lastServerId) {
+    if (!lastServerId || reconnectCooldownSec > 0) {
       return;
     }
 
+    setReconnectCooldownSec(3);
     connectToServer(lastServerId);
   };
 
@@ -354,20 +392,49 @@ export default function App() {
       {showDisconnectedBanner ? (
         <View style={styles.banner}>
           <Text style={styles.bannerTitle}>Disconnected</Text>
-          <Pressable style={[styles.button, styles.primaryButton]} onPress={onReconnectPress}>
-            <Text style={styles.primaryButtonText}>Reconnect</Text>
+          <Pressable
+            style={[
+              styles.button,
+              styles.primaryButton,
+              reconnectCooldownSec > 0 || connectionState === "connecting" ? styles.disabled : null,
+            ]}
+            onPress={onReconnectPress}
+            disabled={reconnectCooldownSec > 0 || connectionState === "connecting"}
+          >
+            <Text style={styles.primaryButtonText}>
+              {reconnectCooldownSec > 0 ? `Reconnect (${reconnectCooldownSec}s)` : "Reconnect"}
+            </Text>
           </Pressable>
         </View>
       ) : null}
 
       <ScrollView ref={transcriptScroll} style={styles.transcript} contentContainerStyle={styles.transcriptContent}>
         {transcript.length === 0 ? <Text style={styles.empty}>No messages yet.</Text> : null}
-        {transcript.map((entry, index) => (
-          <View key={`${entry.role}-${index}`} style={styles.message}>
-            <Text style={styles.messageRole}>{entry.role.toUpperCase()}</Text>
-            <Text style={styles.messageText}>{entry.text || "..."}</Text>
-          </View>
-        ))}
+        {transcript.map((entry, index) => {
+          const isActiveAssistantMessage =
+            entry.role === "assistant" &&
+            isGenerating &&
+            activeAssistant.current?.index === index;
+          const renderedText =
+            entry.role === "assistant" && entry.aborted
+              ? `${entry.text ? `${entry.text} ` : ""}[Aborted]`
+              : entry.text;
+
+          return (
+            <View key={`${entry.role}-${index}`} style={styles.message}>
+              <Text style={styles.messageRole}>{entry.role.toUpperCase()}</Text>
+              <View style={styles.messageBody}>
+                {renderedText ? <Text style={styles.messageText}>{renderedText}</Text> : null}
+                {isActiveAssistantMessage ? (
+                  <ActivityIndicator size="small" color="#4b578f" />
+                ) : null}
+                {!renderedText && !isActiveAssistantMessage ? (
+                  <Text style={styles.messageText}>...</Text>
+                ) : null}
+              </View>
+            </View>
+          );
+        })}
       </ScrollView>
 
       <TextInput
@@ -559,5 +626,10 @@ const styles = StyleSheet.create({
   messageText: {
     color: "#1b1f3a",
     lineHeight: 20,
+  },
+  messageBody: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
   },
 });
