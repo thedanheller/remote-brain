@@ -80,7 +80,8 @@ class HostApp {
       this.logger.error("Ollama health check failed:", result.error);
       this.trayMenu.setState("error", "OLLAMA_NOT_FOUND");
     } else {
-      this.logger.log("Ollama is healthy");
+      this.logger.log("Ollama is healthy - setting state to ready");
+      this.trayMenu.setState("ready");
     }
   }
 
@@ -133,11 +134,24 @@ class HostApp {
   private async stopServer(): Promise<void> {
     try {
       this.logger.log("Stopping server...");
+
+      const clientCount = this.swarmServer.getClientCount();
+
+      // Abort any active inference and release the gate
+      if (this.relay.isBusy()) {
+        const activeRequestId = this.relay.getActiveRequestId();
+        this.logger.log(`Aborting active inference: ${activeRequestId}`);
+        this.relay.abortActiveInference();
+      }
+
+      // Close all connected sockets and leave the topic
       await this.swarmServer.stop();
+
       this.trayMenu.setServerId(null);
       this.trayMenu.setState("stopped");
       this.trayMenu.setClientCount(0);
-      this.logger.log("Server stopped");
+
+      this.logger.log(`Server stopped. ${clientCount} client${clientCount !== 1 ? 's' : ''} disconnected.`);
     } catch (error) {
       this.logger.error("Failed to stop server:", error);
       dialog.showErrorBox("Failed to Stop Server", String(error));
@@ -256,6 +270,9 @@ class HostApp {
     Logger.closeFileStream();
   }
 }
+
+// Set application name
+app.setName("LocalLLM");
 
 // Prevent multiple instances
 if (!app.requestSingleInstanceLock()) {

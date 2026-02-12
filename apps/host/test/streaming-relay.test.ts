@@ -243,4 +243,54 @@ describe("StreamingRelay", () => {
     expect(mockAbort).toHaveBeenCalledWith("req-1");
     expect((relay as any).socketMap.has(socket)).toBe(false);
   });
+
+  it("should send OLLAMA_NOT_FOUND error when Ollama becomes unreachable mid-inference", async () => {
+    relay.handleConnection(socket);
+    socket.clearMessages();
+
+    let ollamaUnreachableCalled = false;
+    relay = new StreamingRelay({
+      model: "llama3.2",
+      hostName: "Test Host",
+      onOllamaUnreachable: () => {
+        ollamaUnreachableCalled = true;
+      },
+    });
+
+    relay.handleConnection(socket);
+    socket.clearMessages();
+
+    // Mock Ollama to simulate connection refused error mid-inference
+    const mockGenerate = vi.fn().mockImplementation((requestId, model, prompt, callbacks) => {
+      // Simulate Ollama becoming unreachable during generation
+      setTimeout(() => {
+        callbacks.onError(ErrorCode.OLLAMA_NOT_FOUND, "Cannot connect to Ollama (not running?)");
+      }, 10);
+    });
+
+    (relay as any).ollama.generate = mockGenerate;
+
+    socket.simulateMessage({
+      type: "chat_start",
+      request_id: "req-1",
+      payload: { prompt: "Test prompt" },
+    });
+
+    // Wait for the error to be processed
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    const messages = socket.getMessages();
+    const errorMessage = messages.find((m) => m.type === "error" && m.request_id === "req-1");
+
+    // Verify error message was sent to client
+    expect(errorMessage).toBeDefined();
+    expect(errorMessage?.payload?.code).toBe(ErrorCode.OLLAMA_NOT_FOUND);
+    expect(errorMessage?.payload?.message).toContain("Cannot connect to Ollama");
+
+    // Verify onOllamaUnreachable callback was triggered
+    expect(ollamaUnreachableCalled).toBe(true);
+
+    // Verify gate was released (relay should no longer be busy)
+    expect(relay.isBusy()).toBe(false);
+  });
 });

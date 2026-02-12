@@ -272,4 +272,25 @@ export class StreamingRelay {
   getModel(): string {
     return this.config.model;
   }
+
+  /**
+   * Abort active inference and release the gate.
+   * Used during graceful shutdown.
+   */
+  abortActiveInference(): void {
+    const activeRequestId = this.gate.getActiveRequest();
+    if (activeRequestId) {
+      this.logger.log(`Aborting active inference: ${activeRequestId}`);
+      this.ollama.abort(activeRequestId);
+      this.gate.release(activeRequestId);
+
+      // Clear socket mapping
+      for (const [socket, requestId] of this.socketMap.entries()) {
+        if (requestId === activeRequestId) {
+          this.socketMap.delete(socket);
+          break;
+        }
+      }
+    }
+  }
 }
