@@ -42,12 +42,65 @@ export class TrayMenu {
    * Initialize the tray icon and menu.
    */
   async init(): Promise<void> {
-    // Create a simple tray icon (you can replace this with a custom icon)
-    const icon = nativeImage.createEmpty();
+    // Create a simple text-based tray icon for macOS
+    // Generate a 16x16 PNG with "LLM" text
+    const icon = this.createTrayIcon();
     this.tray = new Tray(icon);
     this.tray.setToolTip("LocalLLM Host");
 
     this.updateMenu();
+  }
+
+  /**
+   * Create a simple monochrome tray icon.
+   */
+  private createTrayIcon(): Electron.NativeImage {
+    // Create a 16x16 canvas-like bitmap
+    // For macOS, we'll use a Template image (monochrome)
+    const size = 16;
+    const canvas = Buffer.alloc(size * size * 4); // RGBA
+
+    // Fill with transparent background
+    canvas.fill(0);
+
+    // Draw simple "LLM" pattern (simplified pixel art)
+    // This creates a minimal recognizable icon
+    const setPixel = (x: number, y: number, alpha: number) => {
+      if (x >= 0 && x < size && y >= 0 && y < size) {
+        const idx = (y * size + x) * 4;
+        canvas[idx] = 0;     // R
+        canvas[idx + 1] = 0; // G
+        canvas[idx + 2] = 0; // B
+        canvas[idx + 3] = alpha; // A (0-255)
+      }
+    };
+
+    // Draw a simple "LLM" text pattern (3x5 pixels per letter, with spacing)
+    // Letter "L" at x=2
+    for (let y = 4; y < 9; y++) setPixel(2, y, 255);
+    setPixel(3, 8, 255);
+
+    // Letter "L" at x=5
+    for (let y = 4; y < 9; y++) setPixel(5, y, 255);
+    setPixel(6, 8, 255);
+
+    // Letter "M" at x=8-11
+    for (let y = 4; y < 9; y++) {
+      setPixel(8, y, 255);
+      setPixel(11, y, 255);
+    }
+    setPixel(9, 5, 255);
+    setPixel(10, 5, 255);
+
+    const image = nativeImage.createFromBuffer(canvas, {
+      width: size,
+      height: size,
+    });
+
+    // Mark as template image for macOS (will adapt to light/dark mode)
+    image.setTemplateImage(true);
+
+    return image;
   }
 
   /**
