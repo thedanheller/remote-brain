@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type Dispatch, type SetStateAction } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { StatusBar } from "expo-status-bar";
 import {
   ActivityIndicator,
@@ -12,101 +12,165 @@ import {
   View,
 } from "react-native";
 import { CameraView, useCameraPermissions, type BarcodeScanningResult } from "expo-camera";
-import { BareSwarmTransport } from "./src/services/bareSwarmTransport";
-import { ProtocolClient } from "./src/services/protocolClient";
-import type { ConnectionStatus, TranscriptEntry } from "./src/types/client";
+import bs58 from "bs58";
+import { MAX_PROMPT_SIZE } from "@localllm/protocol";
+import { WorkletBridge } from "./src/services/workletBridge";
+import type { WorkletEvent } from "./src/types/bridge";
 
-function appendSystemMessage(setter: Dispatch<SetStateAction<TranscriptEntry[]>>, text: string) {
-  setter((prev) => [
-    ...prev,
-    {
-      id: `sys-${Date.now()}-${Math.random()}`,
-      role: "system",
-      text,
-    },
-  ]);
+type Screen = "connect" | "scanner" | "chat";
+
+type ConnectionState = "disconnected" | "connecting" | "connected";
+
+type TranscriptEntry = {
+  role: "user" | "assistant";
+  text: string;
+};
+
+function parseServerId(raw: string): string | null {
+  const candidate = raw.trim();
+  if (!candidate) {
+    return null;
+  }
+
+  try {
+    const decoded = bs58.decode(candidate);
+    return decoded.length === 32 ? candidate : null;
+  } catch {
+    return null;
+  }
 }
 
 export default function App() {
-  const [connection, setConnection] = useState<ConnectionStatus>({ state: "disconnected" });
+  const [screen, setScreen] = useState<Screen>("connect");
+  const [connectionState, setConnectionState] = useState<ConnectionState>("disconnected");
+  const [connectionError, setConnectionError] = useState<string | null>(null);
   const [serverIdInput, setServerIdInput] = useState("");
+  const [lastServerId, setLastServerId] = useState<string | null>(null);
   const [hostName, setHostName] = useState<string | null>(null);
   const [modelName, setModelName] = useState<string | null>(null);
   const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
   const [prompt, setPrompt] = useState("");
   const [isGenerating, setIsGenerating] = useState(false);
-  const [showScanner, setShowScanner] = useState(false);
-  const [permission, requestPermission] = useCameraPermissions();
+  const [showDisconnectedBanner, setShowDisconnectedBanner] = useState(false);
+  const [scannerLocked, setScannerLocked] = useState(false);
 
-  const clientRef = useRef<ProtocolClient | null>(null);
-  const assistantByRequest = useRef<Map<string, string>>(new Map());
+  const [cameraPermission, requestCameraPermission] = useCameraPermissions();
+
   const transcriptScroll = useRef<ScrollView | null>(null);
+  const activeAssistant = useRef<{ requestId: string | null; index: number } | null>(null);
+  const bridgeRef = useRef<WorkletBridge | null>(null);
+
+  const promptLength = prompt.trim().length;
+  const promptTooLong = promptLength > MAX_PROMPT_SIZE;
+  const isPromptEmpty = promptLength === 0;
 
   useEffect(() => {
-    const transport = new BareSwarmTransport();
-    const client = new ProtocolClient(transport, {
-      onConnectionState: (state, message) => {
-        setConnection({ state, message });
+    const bridge = new WorkletBridge();
+    bridgeRef.current = bridge;
 
-        if (state !== "connected") {
-          setIsGenerating(false);
-        }
-      },
-      onEvent: (event) => {
-        if (event.type === "server_info") {
-          setHostName(event.message.payload.host_name);
-          setModelName(event.message.payload.model);
-          return;
-        }
+    bridge.onEvent((event: WorkletEvent) => {
+      if (event.type === "onServerInfo") {
+        setHostName(event.hostName);
+        setModelName(event.model);
+        setConnectionState("connected");
+        setConnectionError(null);
+        setShowDisconnectedBanner(false);
+        setScreen("chat");
+        return;
+      }
 
-        if (event.type === "chat_chunk") {
-          const assistantId = assistantByRequest.current.get(event.requestId);
-          if (!assistantId) {
-            return;
+      if (event.type === "onChunk") {
+        setTranscript((previous) => {
+          if (activeAssistant.current && activeAssistant.current.requestId === event.requestId) {
+            const next = [...previous];
+            const target = next[activeAssistant.current.index];
+            if (target) {
+              next[activeAssistant.current.index] = {
+                ...target,
+                text: `${target.text}${event.text}`,
+              };
+            }
+            return next;
           }
 
-          setTranscript((prev) =>
-            prev.map((entry) =>
-              entry.id === assistantId ? { ...entry, text: `${entry.text}${event.text}` } : entry,
-            ),
-          );
-          return;
-        }
-
-        if (event.type === "chat_end") {
-          assistantByRequest.current.delete(event.message.request_id);
-          setIsGenerating(false);
-          return;
-        }
-
-        if (event.type === "error") {
-          const errorMessage = `${event.message.payload.code}: ${event.message.payload.message}`;
-          appendSystemMessage(setTranscript, errorMessage);
-          if (event.message.request_id) {
-            assistantByRequest.current.delete(event.message.request_id);
+          if (activeAssistant.current && activeAssistant.current.requestId === null) {
+            const next = [...previous];
+            const target = next[activeAssistant.current.index];
+            if (target) {
+              next[activeAssistant.current.index] = {
+                ...target,
+                text: `${target.text}${event.text}`,
+              };
+            }
+            activeAssistant.current = {
+              requestId: event.requestId,
+              index: activeAssistant.current.index,
+            };
+            return next;
           }
-          setIsGenerating(false);
-          return;
-        }
 
-        if (event.type === "timeout") {
-          appendSystemMessage(setTranscript, "TIMEOUT_NO_RESPONSE: No response from host in 30 seconds");
-          assistantByRequest.current.delete(event.requestId);
-          setIsGenerating(false);
-          return;
-        }
+          activeAssistant.current = {
+            requestId: event.requestId,
+            index: previous.length,
+          };
+          return [...previous, { role: "assistant", text: event.text }];
+        });
+        return;
+      }
 
-        if (event.type === "bad_message") {
-          appendSystemMessage(setTranscript, `BAD_MESSAGE: ${event.error}`);
+      if (event.type === "onChatEnd") {
+        if (activeAssistant.current?.requestId === event.requestId) {
+          activeAssistant.current = null;
         }
-      },
+        setIsGenerating(false);
+        return;
+      }
+
+      if (event.type === "onError") {
+        setConnectionError(`${event.code}: ${event.message}`);
+
+        if (event.requestId && activeAssistant.current?.requestId === event.requestId) {
+          setTranscript((previous) => {
+            const targetIndex = activeAssistant.current?.index;
+            if (targetIndex === undefined) {
+              return previous;
+            }
+
+            const next = [...previous];
+            const target = next[targetIndex];
+            if (target && !target.text) {
+              next[targetIndex] = {
+                ...target,
+                text: `[${event.code}] ${event.message}`,
+              };
+            }
+            return next;
+          });
+          activeAssistant.current = null;
+          setIsGenerating(false);
+        }
+        return;
+      }
+
+      if (event.type === "onDisconnect") {
+        setConnectionState("disconnected");
+        setIsGenerating(false);
+        activeAssistant.current = null;
+
+        if (event.code === "HOST_DISCONNECTED") {
+          setShowDisconnectedBanner(true);
+          setConnectionError(null);
+          setScreen("chat");
+        } else {
+          setShowDisconnectedBanner(false);
+          setScreen("connect");
+        }
+      }
     });
 
-    clientRef.current = client;
-
     return () => {
-      client.destroy();
-      clientRef.current = null;
+      bridge.destroy();
+      bridgeRef.current = null;
     };
   }, []);
 
@@ -114,210 +178,242 @@ export default function App() {
     transcriptScroll.current?.scrollToEnd({ animated: true });
   }, [transcript]);
 
-  const canShowChat = connection.state === "connected" && Boolean(hostName && modelName);
-
-  const statusLabel = useMemo(() => {
-    if (connection.state === "error") {
-      return connection.message ?? "Connection error";
-    }
-
-    if (connection.state === "connecting") {
+  const statusText = useMemo(() => {
+    if (connectionState === "connecting") {
       return "Connecting...";
     }
 
-    if (connection.state === "connected") {
+    if (connectionState === "connected") {
       return "Connected";
     }
 
     return "Disconnected";
-  }, [connection]);
+  }, [connectionState]);
 
-  const connect = () => {
-    const serverId = serverIdInput.trim();
-    if (!serverId) {
-      Alert.alert("Missing Server ID", "Paste or scan a Server ID first.");
+  const connectToServer = (serverId: string) => {
+    const parsed = parseServerId(serverId);
+    if (!parsed) {
+      Alert.alert("Invalid Server ID", "Server ID must be a valid base58 value decoding to 32 bytes.");
       return;
     }
 
-    setHostName(null);
-    setModelName(null);
-    setTranscript([]);
-    assistantByRequest.current.clear();
-    clientRef.current?.connect(serverId);
+    setConnectionState("connecting");
+    setConnectionError(null);
+    setShowDisconnectedBanner(false);
+    setLastServerId(parsed);
+    setServerIdInput(parsed);
+    setScreen("connect");
+
+    bridgeRef.current?.connect(parsed);
   };
 
-  const disconnect = () => {
-    clientRef.current?.disconnect();
-    setHostName(null);
-    setModelName(null);
-    setTranscript([]);
+  const onConnectPress = () => {
+    connectToServer(serverIdInput);
+  };
+
+  const onDisconnectPress = () => {
+    bridgeRef.current?.disconnect();
+    setConnectionState("disconnected");
     setIsGenerating(false);
-    assistantByRequest.current.clear();
+    activeAssistant.current = null;
   };
 
-  const sendPrompt = () => {
-    const text = prompt.trim();
-    if (!text) {
+  const onReconnectPress = () => {
+    if (!lastServerId) {
       return;
     }
 
-    const result = clientRef.current?.sendChatStart(text);
-    if (!result) {
+    connectToServer(lastServerId);
+  };
+
+  const onSendPrompt = () => {
+    const normalized = prompt.trim();
+    if (!normalized || promptTooLong || connectionState !== "connected" || isGenerating) {
       return;
     }
 
-    if (!result.ok) {
-      appendSystemMessage(setTranscript, result.error);
-      return;
-    }
+    setTranscript((previous) => {
+      const assistantIndex = previous.length + 1;
+      activeAssistant.current = { requestId: null, index: assistantIndex };
+      return [...previous, { role: "user", text: normalized }, { role: "assistant", text: "" }];
+    });
 
-    const userId = `user-${result.requestId}`;
-    const assistantId = `assistant-${result.requestId}`;
-
-    assistantByRequest.current.set(result.requestId, assistantId);
-    setTranscript((prev) => [
-      ...prev,
-      { id: userId, role: "user", text },
-      { id: assistantId, role: "assistant", text: "" },
-    ]);
-    setPrompt("");
     setIsGenerating(true);
-  };
-
-  const stopGeneration = () => {
-    clientRef.current?.abort();
-    setIsGenerating(false);
-    appendSystemMessage(setTranscript, "Abort requested");
-  };
-
-  const clearTranscript = () => {
-    assistantByRequest.current.clear();
-    setTranscript([]);
+    setConnectionError(null);
     setPrompt("");
+    bridgeRef.current?.sendPrompt(normalized);
+  };
+
+  const onAbortPress = () => {
+    if (!isGenerating) {
+      return;
+    }
+
+    bridgeRef.current?.abort();
+  };
+
+  const onClearPress = () => {
+    setTranscript([]);
+    activeAssistant.current = null;
+  };
+
+  const openScanner = async () => {
+    const permission = cameraPermission?.granted
+      ? cameraPermission
+      : await requestCameraPermission();
+
+    if (!permission.granted) {
+      Alert.alert("Camera denied", "Camera permission is required for QR scanning.");
+      return;
+    }
+
+    setScannerLocked(false);
+    setScreen("scanner");
   };
 
   const onQrScanned = (result: BarcodeScanningResult) => {
-    if (!showScanner) {
+    if (scannerLocked) {
       return;
     }
 
-    setServerIdInput(result.data);
-    setShowScanner(false);
-  };
+    setScannerLocked(true);
 
-  const requestCamera = async () => {
-    const response = await requestPermission();
-    if (!response.granted) {
-      Alert.alert("Camera denied", "Camera permission is required for QR scan.");
+    const parsed = parseServerId(result.data);
+    if (!parsed) {
+      Alert.alert("Invalid QR", "The scanned QR does not contain a valid base58 Server ID.");
+      setScannerLocked(false);
       return;
     }
 
-    setShowScanner(true);
+    setScreen("connect");
+    connectToServer(parsed);
   };
+
+  const sendDisabled = isGenerating || promptTooLong || isPromptEmpty || connectionState !== "connected";
+
+  const renderConnectScreen = () => (
+    <View style={styles.screen}>
+      <Text style={styles.title}>LocalLLM Client</Text>
+      <Text style={styles.label}>Server ID</Text>
+      <TextInput
+        value={serverIdInput}
+        onChangeText={setServerIdInput}
+        placeholder="Paste base58 Server ID"
+        autoCapitalize="none"
+        autoCorrect={false}
+        editable={connectionState !== "connecting"}
+        style={styles.input}
+      />
+
+      <View style={styles.row}>
+        <Pressable
+          style={[styles.button, styles.primaryButton, connectionState === "connecting" ? styles.disabled : null]}
+          onPress={onConnectPress}
+          disabled={connectionState === "connecting"}
+        >
+          <Text style={styles.primaryButtonText}>Connect</Text>
+        </Pressable>
+        <Pressable style={[styles.button, styles.secondaryButton]} onPress={openScanner}>
+          <Text style={styles.secondaryButtonText}>Scan QR</Text>
+        </Pressable>
+      </View>
+
+      {connectionState === "connecting" ? <ActivityIndicator style={styles.loader} /> : null}
+      <Text style={styles.status}>{statusText}</Text>
+      {connectionError ? <Text style={styles.errorText}>{connectionError}</Text> : null}
+    </View>
+  );
+
+  const renderScannerScreen = () => (
+    <View style={styles.screen}>
+      <Text style={styles.title}>Scan Server QR</Text>
+      <CameraView
+        style={styles.scanner}
+        facing="back"
+        onBarcodeScanned={onQrScanned}
+        barcodeScannerSettings={{ barcodeTypes: ["qr"] }}
+      />
+      <Pressable style={[styles.button, styles.secondaryButton]} onPress={() => setScreen("connect")}>
+        <Text style={styles.secondaryButtonText}>Back</Text>
+      </Pressable>
+    </View>
+  );
+
+  const renderChatScreen = () => (
+    <View style={styles.screen}>
+      <View style={styles.headerRow}>
+        <View>
+          <Text style={styles.host}>{hostName ?? "Host"}</Text>
+          <Text style={styles.model}>Model: {modelName ?? "-"}</Text>
+        </View>
+        <Pressable style={[styles.button, styles.secondaryButton]} onPress={onDisconnectPress}>
+          <Text style={styles.secondaryButtonText}>Disconnect</Text>
+        </Pressable>
+      </View>
+
+      {showDisconnectedBanner ? (
+        <View style={styles.banner}>
+          <Text style={styles.bannerTitle}>Disconnected</Text>
+          <Pressable style={[styles.button, styles.primaryButton]} onPress={onReconnectPress}>
+            <Text style={styles.primaryButtonText}>Reconnect</Text>
+          </Pressable>
+        </View>
+      ) : null}
+
+      <ScrollView ref={transcriptScroll} style={styles.transcript} contentContainerStyle={styles.transcriptContent}>
+        {transcript.length === 0 ? <Text style={styles.empty}>No messages yet.</Text> : null}
+        {transcript.map((entry, index) => (
+          <View key={`${entry.role}-${index}`} style={styles.message}>
+            <Text style={styles.messageRole}>{entry.role.toUpperCase()}</Text>
+            <Text style={styles.messageText}>{entry.text || "..."}</Text>
+          </View>
+        ))}
+      </ScrollView>
+
+      <TextInput
+        value={prompt}
+        onChangeText={setPrompt}
+        editable={!isGenerating && connectionState === "connected"}
+        multiline
+        placeholder="Ask something..."
+        style={styles.promptInput}
+      />
+
+      {promptTooLong ? (
+        <Text style={styles.errorText}>
+          Prompt exceeds {MAX_PROMPT_SIZE} characters. Shorten it to send.
+        </Text>
+      ) : null}
+      {connectionError ? <Text style={styles.errorText}>{connectionError}</Text> : null}
+
+      <View style={styles.row}>
+        <Pressable
+          style={[styles.button, styles.primaryButton, sendDisabled ? styles.disabled : null]}
+          onPress={onSendPrompt}
+          disabled={sendDisabled}
+        >
+          <Text style={styles.primaryButtonText}>Send</Text>
+        </Pressable>
+        <Pressable
+          style={[styles.button, styles.secondaryButton, !isGenerating ? styles.disabled : null]}
+          onPress={onAbortPress}
+          disabled={!isGenerating}
+        >
+          <Text style={styles.secondaryButtonText}>Stop</Text>
+        </Pressable>
+        <Pressable style={[styles.button, styles.secondaryButton]} onPress={onClearPress}>
+          <Text style={styles.secondaryButtonText}>Clear</Text>
+        </Pressable>
+      </View>
+    </View>
+  );
 
   return (
     <SafeAreaView style={styles.safeArea}>
       <StatusBar style="dark" />
-      {!canShowChat ? (
-        <View style={styles.screen}>
-          <Text style={styles.title}>LocalLLM Client</Text>
-          <Text style={styles.label}>Server ID</Text>
-          <TextInput
-            value={serverIdInput}
-            onChangeText={setServerIdInput}
-            autoCapitalize="none"
-            autoCorrect={false}
-            placeholder="Paste base58 Server ID"
-            style={styles.input}
-            editable={connection.state !== "connecting"}
-          />
-          <View style={styles.row}>
-            <Pressable
-              onPress={connect}
-              style={[styles.button, styles.primaryButton]}
-              disabled={connection.state === "connecting"}
-            >
-              <Text style={styles.primaryButtonText}>Connect</Text>
-            </Pressable>
-            <Pressable onPress={requestCamera} style={[styles.button, styles.secondaryButton]}>
-              <Text style={styles.secondaryButtonText}>Scan QR</Text>
-            </Pressable>
-          </View>
-
-          {connection.state === "connecting" ? <ActivityIndicator style={styles.loader} /> : null}
-          <Text style={[styles.status, connection.state === "error" ? styles.errorText : null]}>
-            {statusLabel}
-          </Text>
-
-          {showScanner ? (
-            <View style={styles.scannerWrap}>
-              {permission?.granted ? (
-                <CameraView
-                  style={styles.scanner}
-                  facing="back"
-                  onBarcodeScanned={onQrScanned}
-                  barcodeScannerSettings={{ barcodeTypes: ["qr"] }}
-                />
-              ) : (
-                <Text style={styles.errorText}>Camera permission not granted.</Text>
-              )}
-              <Pressable style={[styles.button, styles.secondaryButton]} onPress={() => setShowScanner(false)}>
-                <Text style={styles.secondaryButtonText}>Close Scanner</Text>
-              </Pressable>
-            </View>
-          ) : null}
-        </View>
-      ) : (
-        <View style={styles.screen}>
-          <View style={styles.headerRow}>
-            <View>
-              <Text style={styles.host}>{hostName}</Text>
-              <Text style={styles.model}>Model: {modelName}</Text>
-            </View>
-            <Pressable onPress={disconnect} style={[styles.button, styles.secondaryButton]}>
-              <Text style={styles.secondaryButtonText}>Disconnect</Text>
-            </Pressable>
-          </View>
-
-          <ScrollView
-            ref={transcriptScroll}
-            style={styles.transcript}
-            contentContainerStyle={styles.transcriptContent}
-          >
-            {transcript.map((entry) => (
-              <View key={entry.id} style={styles.message}>
-                <Text style={styles.messageRole}>{entry.role.toUpperCase()}</Text>
-                <Text style={styles.messageText}>{entry.text || "..."}</Text>
-              </View>
-            ))}
-          </ScrollView>
-
-          <TextInput
-            value={prompt}
-            onChangeText={setPrompt}
-            placeholder="Ask something..."
-            style={styles.promptInput}
-            editable={!isGenerating}
-            multiline
-          />
-
-          <View style={styles.row}>
-            <Pressable onPress={sendPrompt} style={[styles.button, styles.primaryButton]} disabled={isGenerating}>
-              <Text style={styles.primaryButtonText}>Send</Text>
-            </Pressable>
-            <Pressable
-              onPress={stopGeneration}
-              style={[styles.button, styles.secondaryButton]}
-              disabled={!isGenerating}
-            >
-              <Text style={styles.secondaryButtonText}>Stop</Text>
-            </Pressable>
-            <Pressable onPress={clearTranscript} style={[styles.button, styles.secondaryButton]}>
-              <Text style={styles.secondaryButtonText}>Clear</Text>
-            </Pressable>
-          </View>
-        </View>
-      )}
+      {screen === "connect" ? renderConnectScreen() : null}
+      {screen === "scanner" ? renderScannerScreen() : null}
+      {screen === "chat" ? renderChatScreen() : null}
     </SafeAreaView>
   );
 }
@@ -382,6 +478,9 @@ const styles = StyleSheet.create({
   secondaryButton: {
     backgroundColor: "#e3e8ff",
   },
+  disabled: {
+    opacity: 0.5,
+  },
   primaryButtonText: {
     color: "#ffffff",
     fontWeight: "700",
@@ -396,13 +495,10 @@ const styles = StyleSheet.create({
   },
   errorText: {
     color: "#a01536",
+    fontWeight: "600",
   },
   loader: {
     marginTop: 8,
-  },
-  scannerWrap: {
-    marginTop: 8,
-    gap: 10,
   },
   scanner: {
     width: "100%",
@@ -419,6 +515,20 @@ const styles = StyleSheet.create({
     color: "#434d83",
     marginTop: 2,
   },
+  banner: {
+    borderRadius: 10,
+    padding: 10,
+    backgroundColor: "#ffe9ef",
+    borderWidth: 1,
+    borderColor: "#f4bfd0",
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+  },
+  bannerTitle: {
+    color: "#8d1534",
+    fontWeight: "700",
+  },
   transcript: {
     flex: 1,
     borderWidth: 1,
@@ -429,6 +539,9 @@ const styles = StyleSheet.create({
   transcriptContent: {
     padding: 12,
     gap: 8,
+  },
+  empty: {
+    color: "#5f6899",
   },
   message: {
     padding: 10,

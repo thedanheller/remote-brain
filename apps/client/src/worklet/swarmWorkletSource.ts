@@ -3,19 +3,50 @@ const { IPC } = BareKit
 const Hyperswarm = require('hyperswarm')
 const bs58 = require('bs58')
 
+const MAX_PROMPT_SIZE = 8192
+
 let swarm = null
 let discovery = null
 let socket = null
+let inboundBuffer = ''
+let activeRequestId = null
+let closing = false
 
 function emit(event) {
   IPC.write(Buffer.from(JSON.stringify(event)))
 }
 
-async function closeResources(notify) {
+function emitError(code, message, requestId) {
+  const payload = {
+    type: 'onError',
+    code,
+    message
+  }
+
+  if (requestId) {
+    payload.requestId = requestId
+  }
+
+  emit(payload)
+}
+
+async function closeResources() {
+  if (closing) {
+    return
+  }
+
+  closing = true
+
   const previousSocket = socket
   socket = null
+  inboundBuffer = ''
+  activeRequestId = null
 
   if (previousSocket) {
+    try {
+      previousSocket.removeAllListeners()
+    } catch {}
+
     try {
       previousSocket.destroy()
     } catch {}
@@ -23,7 +54,7 @@ async function closeResources(notify) {
 
   if (discovery) {
     try {
-      discovery.destroy()
+      await discovery.destroy()
     } catch {}
     discovery = null
   }
@@ -35,8 +66,127 @@ async function closeResources(notify) {
     swarm = null
   }
 
-  if (notify) {
-    emit({ type: 'disconnected' })
+  closing = false
+}
+
+function nextRequestId() {
+  return 'req-' + Date.now() + '-' + Math.floor(Math.random() * 100000)
+}
+
+function handleProtocolLine(line) {
+  let message
+  try {
+    message = JSON.parse(line)
+  } catch {
+    emitError('BAD_MESSAGE', 'Malformed protocol payload')
+    return
+  }
+
+  if (!message || typeof message.type !== 'string') {
+    emitError('BAD_MESSAGE', 'Protocol message missing type')
+    return
+  }
+
+  if (message.type === 'server_info') {
+    const payload = message.payload
+    if (
+      payload &&
+      typeof payload.host_name === 'string' &&
+      typeof payload.model === 'string' &&
+      (payload.status === 'ready' || payload.status === 'busy')
+    ) {
+      emit({
+        type: 'onServerInfo',
+        hostName: payload.host_name,
+        model: payload.model,
+        status: payload.status
+      })
+      return
+    }
+
+    emitError('BAD_MESSAGE', 'Invalid server_info payload')
+    return
+  }
+
+  if (message.type === 'chat_chunk') {
+    const requestId = message.request_id
+    const payload = message.payload
+
+    if (typeof requestId === 'string' && payload && typeof payload.text === 'string') {
+      emit({
+        type: 'onChunk',
+        requestId,
+        text: payload.text
+      })
+      return
+    }
+
+    emitError('BAD_MESSAGE', 'Invalid chat_chunk payload')
+    return
+  }
+
+  if (message.type === 'chat_end') {
+    const requestId = message.request_id
+    const payload = message.payload
+
+    if (
+      typeof requestId === 'string' &&
+      payload &&
+      (payload.finish_reason === 'stop' || payload.finish_reason === 'abort' || payload.finish_reason === 'error')
+    ) {
+      if (activeRequestId === requestId) {
+        activeRequestId = null
+      }
+
+      emit({
+        type: 'onChatEnd',
+        requestId,
+        finishReason: payload.finish_reason
+      })
+      return
+    }
+
+    emitError('BAD_MESSAGE', 'Invalid chat_end payload')
+    return
+  }
+
+  if (message.type === 'error') {
+    const payload = message.payload
+
+    if (payload && typeof payload.code === 'string' && typeof payload.message === 'string') {
+      const requestId = typeof message.request_id === 'string' ? message.request_id : undefined
+      if (requestId && activeRequestId === requestId) {
+        activeRequestId = null
+      }
+
+      emitError(payload.code, payload.message, requestId)
+      return
+    }
+
+    emitError('BAD_MESSAGE', 'Invalid error payload')
+    return
+  }
+
+  emitError('BAD_MESSAGE', 'Unsupported protocol message type')
+}
+
+function onSocketData(chunk) {
+  inboundBuffer += chunk.toString()
+
+  while (true) {
+    const newlineIndex = inboundBuffer.indexOf('\n')
+    if (newlineIndex === -1) {
+      return
+    }
+
+    const line = inboundBuffer.slice(0, newlineIndex).trim()
+    inboundBuffer = inboundBuffer.slice(newlineIndex + 1)
+
+    if (!line) {
+      continue
+    }
+
+    handleProtocolLine(line)
   }
 }
 
@@ -47,61 +197,54 @@ function attachSocket(nextSocket) {
   }
 
   socket = nextSocket
-  emit({ type: 'connected' })
 
-  nextSocket.on('data', (chunk) => {
-    emit({ type: 'incoming', chunk: chunk.toString() })
+  nextSocket.on('data', onSocketData)
+
+  nextSocket.on('close', async () => {
+    if (closing || socket !== nextSocket) {
+      return
+    }
+
+    await closeResources()
+    emit({
+      type: 'onDisconnect',
+      code: 'HOST_DISCONNECTED',
+      message: 'Host disconnected'
+    })
   })
 
-  nextSocket.on('close', () => {
-    if (socket === nextSocket) {
-      socket = null
-      emit({
-        type: 'network_error',
-        code: 'HOST_DISCONNECTED',
-        message: 'Host disconnected'
-      })
-      emit({ type: 'disconnected' })
+  nextSocket.on('error', async () => {
+    if (closing || socket !== nextSocket) {
+      return
     }
-  })
 
-  nextSocket.on('error', () => {
-    if (socket === nextSocket) {
-      socket = null
-      emit({
-        type: 'network_error',
-        code: 'HOST_DISCONNECTED',
-        message: 'Connection error'
-      })
-      emit({ type: 'disconnected' })
-    }
+    await closeResources()
+    emit({
+      type: 'onDisconnect',
+      code: 'HOST_DISCONNECTED',
+      message: 'Connection error'
+    })
   })
 }
 
 async function handleConnect(serverId) {
-  emit({ type: 'connecting' })
-  await closeResources(false)
+  if (typeof serverId !== 'string') {
+    emitError('INVALID_SERVER_ID', 'Server ID must be a string')
+    return
+  }
+
+  await closeResources()
 
   let topic
   try {
-    topic = bs58.decode(serverId)
+    topic = bs58.decode(serverId.trim())
   } catch {
-    emit({
-      type: 'network_error',
-      code: 'INVALID_SERVER_ID',
-      message: 'Could not decode Server ID'
-    })
-    emit({ type: 'disconnected' })
+    emitError('INVALID_SERVER_ID', 'Could not decode Server ID')
     return
   }
 
   if (!topic || topic.length !== 32) {
-    emit({
-      type: 'network_error',
-      code: 'INVALID_SERVER_ID',
-      message: 'Server ID must decode to 32 bytes'
-    })
-    emit({ type: 'disconnected' })
+    emitError('INVALID_SERVER_ID', 'Server ID must decode to 32 bytes')
     return
   }
 
@@ -113,44 +256,74 @@ async function handleConnect(serverId) {
     })
 
     swarm.on('error', () => {
-      emit({
-        type: 'network_error',
-        code: 'CONNECT_FAILED',
-        message: 'Failed to start Hyperswarm client'
-      })
+      emitError('CONNECT_FAILED', 'Failed to start Hyperswarm client')
     })
 
     discovery = swarm.join(topic, { server: false, client: true })
     await discovery.flushed()
   } catch {
-    emit({
-      type: 'network_error',
-      code: 'CONNECT_FAILED',
-      message: 'Failed to join host topic'
-    })
-    await closeResources(true)
+    await closeResources()
+    emitError('CONNECT_FAILED', 'Failed to join host topic')
   }
 }
 
-function handleSend(data) {
-  if (!socket) {
-    emit({
-      type: 'network_error',
-      code: 'HOST_OFFLINE',
-      message: 'No connected host peer'
-    })
+function handleSendPrompt(prompt) {
+  if (typeof prompt !== 'string') {
+    emitError('BAD_MESSAGE', 'Prompt must be a string')
     return
   }
 
+  const normalized = prompt.trim()
+  if (!normalized) {
+    emitError('BAD_MESSAGE', 'Prompt cannot be empty')
+    return
+  }
+
+  if (normalized.length > MAX_PROMPT_SIZE) {
+    emitError('BAD_MESSAGE', 'Prompt exceeds max size')
+    return
+  }
+
+  if (!socket) {
+    emitError('HOST_OFFLINE', 'No connected host peer')
+    return
+  }
+
+  if (activeRequestId) {
+    emitError('MODEL_BUSY', 'A request is already active', activeRequestId)
+    return
+  }
+
+  const requestId = nextRequestId()
+  const message = JSON.stringify({
+    type: 'chat_start',
+    request_id: requestId,
+    payload: { prompt: normalized }
+  }) + '\n'
+
   try {
-    socket.write(data)
+    socket.write(message)
+    activeRequestId = requestId
   } catch {
-    emit({
-      type: 'network_error',
-      code: 'HOST_DISCONNECTED',
-      message: 'Failed to write to host peer'
-    })
-    emit({ type: 'disconnected' })
+    emitError('HOST_DISCONNECTED', 'Failed to write to host peer')
+  }
+}
+
+function handleAbort() {
+  if (!socket || !activeRequestId) {
+    return
+  }
+
+  const requestId = activeRequestId
+  const message = JSON.stringify({
+    type: 'abort',
+    request_id: requestId
+  }) + '\n'
+
+  try {
+    socket.write(message)
+  } catch {
+    emitError('HOST_DISCONNECTED', 'Failed to send abort', requestId)
   }
 }
 
@@ -159,20 +332,12 @@ IPC.on('data', async (chunk) => {
   try {
     command = JSON.parse(Buffer.from(chunk).toString())
   } catch {
-    emit({
-      type: 'network_error',
-      code: 'BAD_MESSAGE',
-      message: 'Bad worklet command'
-    })
+    emitError('BAD_MESSAGE', 'Bad worklet command')
     return
   }
 
   if (!command || typeof command.type !== 'string') {
-    emit({
-      type: 'network_error',
-      code: 'BAD_MESSAGE',
-      message: 'Missing worklet command type'
-    })
+    emitError('BAD_MESSAGE', 'Missing worklet command type')
     return
   }
 
@@ -182,19 +347,25 @@ IPC.on('data', async (chunk) => {
   }
 
   if (command.type === 'disconnect') {
-    await closeResources(true)
+    await closeResources()
+    emit({
+      type: 'onDisconnect',
+      code: 'USER_DISCONNECTED',
+      message: 'Disconnected'
+    })
     return
   }
 
-  if (command.type === 'send') {
-    handleSend(command.data)
+  if (command.type === 'sendPrompt') {
+    handleSendPrompt(command.prompt)
     return
   }
 
-  emit({
-    type: 'network_error',
-    code: 'BAD_MESSAGE',
-    message: 'Unknown worklet command'
-  })
+  if (command.type === 'abort') {
+    handleAbort()
+    return
+  }
+
+  emitError('BAD_MESSAGE', 'Unknown worklet command')
 })
 `;
