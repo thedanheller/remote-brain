@@ -1,7 +1,6 @@
 export const SWARM_WORKLET_SOURCE = `
 const { IPC } = BareKit
 const Hyperswarm = require('hyperswarm')
-const bs58 = require('bs58')
 
 const MAX_PROMPT_SIZE = 8192
 const SERVER_INFO_TIMEOUT_MS = 15000
@@ -270,26 +269,22 @@ function attachSocket(nextSocket) {
   })
 }
 
-async function handleConnect(serverId) {
-  if (typeof serverId !== 'string') {
-    emitError('INVALID_SERVER_ID', 'Server ID must be a string')
-    return
-  }
-
+async function handleConnect(topicBytes) {
   await closeResources()
 
-  let topic
-  try {
-    topic = bs58.decode(serverId.trim())
-  } catch {
-    emitError('INVALID_SERVER_ID', 'Could not decode Server ID')
+  if (!Array.isArray(topicBytes)) {
+    emitError('INVALID_SERVER_ID', 'Topic must be an array of bytes')
     return
   }
 
-  if (!topic || topic.length !== 32) {
-    emitError('INVALID_SERVER_ID', 'Server ID must decode to 32 bytes')
+  const validLength = topicBytes.length === 32
+  const validByteValues = topicBytes.every((value) => Number.isInteger(value) && value >= 0 && value <= 255)
+  if (!validLength || !validByteValues) {
+    emitError('INVALID_SERVER_ID', 'Topic must contain exactly 32 bytes')
     return
   }
+
+  const topic = Buffer.from(topicBytes)
 
   try {
     swarm = new Hyperswarm()
@@ -387,7 +382,7 @@ IPC.on('data', async (chunk) => {
   }
 
   if (command.type === 'connect') {
-    await handleConnect(command.serverId)
+    await handleConnect(command.topic)
     return
   }
 
