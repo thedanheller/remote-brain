@@ -39,3 +39,7 @@ yarn-error.*
 # generated native folders
 /ios
 /android
+
+# Generated worklet files (template lives in src/worklet/swarmWorkletSource.ts)
+backend/swarm-client.mjs
+src/worklet/swarmWorkletBundle.generated.ts

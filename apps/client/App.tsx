@@ -17,7 +17,7 @@ import {
 import { CameraView, useCameraPermissions, type BarcodeScanningResult } from "expo-camera";
 import { ErrorCode, MAX_PROMPT_SIZE } from "@localllm/protocol";
 import { WorkletBridge } from "./src/services/workletBridge";
-import type { WorkletEvent } from "./src/types/bridge";
+import type { ConnectDiagnosticMode, WorkletEvent } from "./src/types/bridge";
 import { isSendDisabled, parseServerId } from "./src/utils/inputValidation";
 
 type Screen = "connect" | "scanner" | "chat" | "debug";
@@ -31,6 +31,11 @@ type TranscriptEntry = {
 };
 
 const MAX_DEBUG_LOG_ENTRIES = 300;
+const CONNECT_DIAGNOSTIC_OPTIONS: Array<{ mode: ConnectDiagnosticMode; label: string; note: string }> = [
+  { mode: "full", label: "Full", note: "Normal connect behavior" },
+  { mode: "decode_only", label: "Decode only", note: "Stop before swarm.join (Run A)" },
+  { mode: "join_only", label: "Join only", note: "Run swarm.join and short-circuit socket flow (Run B)" },
+];
 
 export default function App() {
   const [screen, setScreen] = useState<Screen>("connect");
@@ -50,6 +55,7 @@ export default function App() {
   const [reconnectCooldownSec, setReconnectCooldownSec] = useState(0);
   const [requestCount, setRequestCount] = useState(0);
   const [rawMessageLog, setRawMessageLog] = useState<string[]>([]);
+  const [connectDiagnosticMode, setConnectDiagnosticMode] = useState<ConnectDiagnosticMode>("full");
 
   const [cameraPermission, requestCameraPermission] = useCameraPermissions();
 
@@ -318,7 +324,7 @@ export default function App() {
     setServerIdInput(parsed);
     setScreen("connect");
 
-    bridgeRef.current?.connect(parsed);
+    bridgeRef.current?.connect(parsed, { diagnosticMode: connectDiagnosticMode });
   };
 
   const onConnectPress = () => {
@@ -633,6 +639,39 @@ export default function App() {
         <Text style={styles.debugRow}>Server ID: {lastServerId ?? "-"}</Text>
         <Text style={styles.debugRow}>Request count: {requestCount}</Text>
         <Text style={styles.debugRow}>Last error: {lastError ?? "None"}</Text>
+        <Text style={styles.debugRow}>Connect mode: {connectDiagnosticMode}</Text>
+      </View>
+
+      <View style={styles.debugCard}>
+        <Text style={styles.label}>Connect Diagnostic Mode</Text>
+        <View style={styles.debugModeRow}>
+          {CONNECT_DIAGNOSTIC_OPTIONS.map((option) => (
+            <Pressable
+              key={option.mode}
+              style={[
+                styles.debugModeButton,
+                option.mode === connectDiagnosticMode ? styles.debugModeButtonActive : null,
+              ]}
+              onPress={() => setConnectDiagnosticMode(option.mode)}
+            >
+              <Text
+                style={[
+                  styles.debugModeButtonText,
+                  option.mode === connectDiagnosticMode ? styles.debugModeButtonTextActive : null,
+                ]}
+              >
+                {option.label}
+              </Text>
+            </Pressable>
+          ))}
+        </View>
+        {CONNECT_DIAGNOSTIC_OPTIONS.map((option) =>
+          option.mode === connectDiagnosticMode ? (
+            <Text key={`${option.mode}-note`} style={styles.debugRow}>
+              {option.note}
+            </Text>
+          ) : null,
+        )}
       </View>
 
       <View style={styles.debugLogCard}>
@@ -892,6 +931,30 @@ const styles = StyleSheet.create({
   debugRow: {
     color: "#1f2751",
     fontWeight: "500",
+  },
+  debugModeRow: {
+    flexDirection: "row",
+    gap: 8,
+  },
+  debugModeButton: {
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: "#bfc9f7",
+    backgroundColor: "#eff3ff",
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+  },
+  debugModeButtonActive: {
+    borderColor: "#2448d6",
+    backgroundColor: "#2448d6",
+  },
+  debugModeButtonText: {
+    color: "#2140be",
+    fontWeight: "700",
+    fontSize: 12,
+  },
+  debugModeButtonTextActive: {
+    color: "#ffffff",
   },
   debugLogCard: {
     flex: 1,

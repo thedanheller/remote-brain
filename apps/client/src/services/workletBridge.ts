@@ -1,7 +1,12 @@
 import { Worklet } from "react-native-bare-kit";
 import bs58 from "bs58";
-import { SWARM_WORKLET_SOURCE } from "../worklet/swarmWorkletSource";
-import type { BridgeCommand, WorkletEvent, WorkletEventHandler } from "../types/bridge";
+import { SWARM_WORKLET_BUNDLE } from "../worklet/swarmWorkletBundle";
+import type {
+  BridgeCommand,
+  ConnectDiagnosticMode,
+  WorkletEvent,
+  WorkletEventHandler,
+} from "../types/bridge";
 
 interface WorkletIpc {
   on: (event: "data", handler: (chunk: Uint8Array) => void) => void;
@@ -56,6 +61,7 @@ export class WorkletBridge {
   private readonly decoder = new TextDecoder();
   private handler: WorkletEventHandler | null = null;
   private started = false;
+  private ipcBuffer = "";
 
   constructor() {
     this.worklet = new Worklet();
@@ -66,28 +72,44 @@ export class WorkletBridge {
         return;
       }
 
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(this.decoder.decode(chunk));
-      } catch {
-        this.handler({
-          type: "onError",
-          code: "BAD_MESSAGE",
-          message: "Malformed worklet event",
-        });
-        return;
-      }
+      this.ipcBuffer += this.decoder.decode(chunk);
 
-      if (!isWorkletEvent(parsed)) {
-        this.handler({
-          type: "onError",
-          code: "BAD_MESSAGE",
-          message: "Unsupported worklet event",
-        });
-        return;
-      }
+      while (true) {
+        const newlineIndex = this.ipcBuffer.indexOf("\n");
+        if (newlineIndex === -1) {
+          break;
+        }
 
-      this.handler(parsed);
+        const line = this.ipcBuffer.slice(0, newlineIndex).trim();
+        this.ipcBuffer = this.ipcBuffer.slice(newlineIndex + 1);
+
+        if (!line) {
+          continue;
+        }
+
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(line);
+        } catch {
+          this.handler({
+            type: "onError",
+            code: "BAD_MESSAGE",
+            message: "Malformed worklet event",
+          });
+          continue;
+        }
+
+        if (!isWorkletEvent(parsed)) {
+          this.handler({
+            type: "onError",
+            code: "BAD_MESSAGE",
+            message: "Unsupported worklet event",
+          });
+          continue;
+        }
+
+        this.handler(parsed);
+      }
     });
   }
 
@@ -95,7 +117,7 @@ export class WorkletBridge {
     this.handler = handler;
   }
 
-  connect(serverId: string): void {
+  connect(serverId: string, options?: { diagnosticMode?: ConnectDiagnosticMode }): void {
     this.ensureStarted();
     const candidate = serverId.trim();
 
@@ -120,7 +142,12 @@ export class WorkletBridge {
       return;
     }
 
-    this.send({ type: "connect", topic: Array.from(topic) });
+    const command: BridgeCommand = { type: "connect", topic: Array.from(topic) };
+    if (options?.diagnosticMode && options.diagnosticMode !== "full") {
+      command.diagnosticMode = options.diagnosticMode;
+    }
+
+    this.send(command);
   }
 
   disconnect(): void {
@@ -152,7 +179,7 @@ export class WorkletBridge {
       return;
     }
 
-    this.worklet.start("/swarm-client.js", SWARM_WORKLET_SOURCE);
+    this.worklet.start("/swarm-client.bundle", SWARM_WORKLET_BUNDLE);
     this.started = true;
   }
 

@@ -9,3 +9,4 @@ pnpm-debug.log*
 dist/
 build/
 .expo/
+docs/crash.log
