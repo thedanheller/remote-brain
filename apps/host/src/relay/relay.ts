@@ -153,9 +153,10 @@ export class StreamingRelay {
 
     this.logger.log(`Received chat_start for request ${request_id}`);
 
-    // Validate prompt size (max 8 KB)
-    if (payload.prompt.length > 8192) {
-      this.logger.warn(`Request ${request_id} rejected: prompt too large`);
+    // Validate prompt size (max 8 KB in bytes, not characters)
+    const promptBytes = Buffer.byteLength(payload.prompt, 'utf-8');
+    if (promptBytes > 8192) {
+      this.logger.warn(`Request ${request_id} rejected: prompt too large (${promptBytes} bytes)`);
       if (socket.writable) {
         socket.write(
           encode(

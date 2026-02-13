@@ -2,6 +2,7 @@ import { app, Menu, Tray, clipboard, nativeImage, BrowserWindow } from "electron
 import QRCode from "qrcode";
 import path from "path";
 import { fileURLToPath } from "url";
+import { Logger } from "../utils/logger.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -33,9 +34,11 @@ export class TrayMenu {
   private qrWindow: BrowserWindow | null = null;
   private errorMessage: string | null = null;
   private activeRequestId: string | null = null;
+  private logger: Logger;
 
   constructor(callbacks: MenuCallbacks) {
     this.callbacks = callbacks;
+    this.logger = new Logger("TrayMenu");
   }
 
   /**
@@ -380,7 +383,7 @@ export class TrayMenu {
         this.qrWindow = null;
       });
     } catch (error) {
-      console.error("Failed to show QR code:", error);
+      this.logger.error("Failed to show QR code:", error);
     }
   }
 
