@@ -143,7 +143,7 @@ export class OllamaAdapter {
                 return;
               }
             } catch (error) {
-              console.error("Failed to parse Ollama chunk:", error);
+              this.logger.error("Failed to parse Ollama chunk:", error);
             }
           }
         }

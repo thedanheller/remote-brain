@@ -289,9 +289,14 @@ if (!app.requestSingleInstanceLock()) {
   app.on("before-quit", async (event) => {
     if (hostApp) {
       event.preventDefault();
-      await hostApp.cleanup();
-      hostApp = null;
-      app.exit(0);
+      try {
+        await hostApp.cleanup();
+      } catch (error) {
+        console.error("Error during cleanup:", error);
+      } finally {
+        hostApp = null;
+        app.exit(0);
+      }
     }
   });
 
