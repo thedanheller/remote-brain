@@ -6,8 +6,8 @@
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
-    "dev": "tsc && node dist/index.js",
-    "start": "node dist/index.js",
+    "dev": "tsc && electron .",
+    "start": "electron .",
     "test": "vitest",
     "test:e2e": "tsc && node dist/test/e2e/mock-client.js"
   },
