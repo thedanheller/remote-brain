@@ -55,11 +55,11 @@ export class WorkletBridge {
   private readonly encoder = new TextEncoder();
   private readonly decoder = new TextDecoder();
   private handler: WorkletEventHandler | null = null;
+  private started = false;
 
   constructor() {
     this.worklet = new Worklet();
     this.ipc = this.worklet.IPC as unknown as WorkletIpc;
-    this.worklet.start("/swarm-client.js", SWARM_WORKLET_SOURCE);
 
     this.ipc.on("data", (chunk: Uint8Array) => {
       if (!this.handler) {
@@ -96,6 +96,7 @@ export class WorkletBridge {
   }
 
   connect(serverId: string): void {
+    this.ensureStarted();
     const candidate = serverId.trim();
 
     let topic: Uint8Array;
@@ -123,20 +124,36 @@ export class WorkletBridge {
   }
 
   disconnect(): void {
+    if (!this.started) {
+      return;
+    }
     this.send({ type: "disconnect" });
   }
 
   sendPrompt(prompt: string): void {
+    this.ensureStarted();
     this.send({ type: "sendPrompt", prompt });
   }
 
   abort(): void {
+    if (!this.started) {
+      return;
+    }
     this.send({ type: "abort" });
   }
 
   destroy(): void {
     this.handler = null;
     this.worklet.terminate();
+  }
+
+  private ensureStarted(): void {
+    if (this.started) {
+      return;
+    }
+
+    this.worklet.start("/swarm-client.js", SWARM_WORKLET_SOURCE);
+    this.started = true;
   }
 
   private send(command: BridgeCommand): void {

@@ -50,6 +50,7 @@ describe("WorkletBridge", () => {
 
     bridge.connect(serverId);
 
+    expect(mockStart).toHaveBeenCalledTimes(1);
     expect(mockWrite).toHaveBeenCalledTimes(1);
     const command = decodeCommandPayload(mockWrite.mock.calls[0][0] as Uint8Array);
     expect(command).toEqual({
@@ -60,11 +61,14 @@ describe("WorkletBridge", () => {
 
   test("disconnect sends disconnect command for worklet-side cleanup", () => {
     const bridge = new WorkletBridge();
+    const serverId = bs58.encode(Uint8Array.from({ length: 32 }, (_, i) => i + 1));
+
+    bridge.connect(serverId);
 
     bridge.disconnect();
 
-    expect(mockWrite).toHaveBeenCalledTimes(1);
-    const command = decodeCommandPayload(mockWrite.mock.calls[0][0] as Uint8Array);
+    expect(mockWrite).toHaveBeenCalledTimes(2);
+    const command = decodeCommandPayload(mockWrite.mock.calls[1][0] as Uint8Array);
     expect(command).toEqual({ type: "disconnect" });
   });
 
