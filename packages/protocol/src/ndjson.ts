@@ -3,17 +3,33 @@ export function encode(obj: unknown): string {
 }
 
 export type DecoderCallback = (parsed: unknown) => void;
+export type DecoderErrorCallback = (error: string) => void;
 
 export interface Decoder {
   write(chunk: string): void;
 }
 
-export function createDecoder(onMessage: DecoderCallback): Decoder {
+// Maximum buffer size: 64 KB
+const MAX_BUFFER_SIZE = 64 * 1024;
+
+export function createDecoder(
+  onMessage: DecoderCallback,
+  onError?: DecoderErrorCallback,
+): Decoder {
   let buffer = "";
 
   return {
     write(chunk: string) {
       buffer += chunk;
+
+      // Check buffer limit
+      if (buffer.length > MAX_BUFFER_SIZE) {
+        buffer = "";
+        if (onError) {
+          onError("Buffer exceeded 64 KB without finding newline");
+        }
+        return;
+      }
 
       let newlineIndex: number;
       while ((newlineIndex = buffer.indexOf("\n")) !== -1) {

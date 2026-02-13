@@ -4,6 +4,9 @@ import {
   createDecoder,
   ErrorCode,
   createErrorMessage,
+  validateMessage,
+  isChatStart,
+  isAbort,
   type ProtocolMessage,
   type ChatStartMessage,
   type AbortMessage,
@@ -47,9 +50,18 @@ export class StreamingRelay {
    */
   handleConnection(socket: Duplex): void {
     this.logger.log("Handling new client connection");
-    const decoder = createDecoder((parsed) => {
-      this.handleMessage(socket, parsed);
-    });
+    const decoder = createDecoder(
+      (parsed) => {
+        this.handleMessage(socket, parsed);
+      },
+      (error) => {
+        this.logger.error("NDJSON decoder error:", error);
+        if (socket.writable) {
+          socket.write(encode(createErrorMessage(ErrorCode.BAD_MESSAGE, error)));
+        }
+        socket.destroy();
+      },
+    );
 
     // Send server_info on connection
     this.sendServerInfo(socket);
@@ -78,6 +90,11 @@ export class StreamingRelay {
    * If the write doesn't flush within 5 seconds, close the socket.
    */
   private sendServerInfo(socket: Duplex): void {
+    if (!socket.writable) {
+      this.logger.warn("Cannot send server_info: socket not writable");
+      return;
+    }
+
     const message: ServerInfoMessage = {
       type: "server_info",
       payload: {
@@ -105,24 +122,26 @@ export class StreamingRelay {
    * Handle incoming protocol messages.
    */
   private handleMessage(socket: Duplex, parsed: unknown): void {
-    try {
-      const message = parsed as ProtocolMessage;
-
-      switch (message.type) {
-        case "chat_start":
-          this.handleChatStart(socket, message as ChatStartMessage);
-          break;
-
-        case "abort":
-          this.handleAbort(socket, message as AbortMessage);
-          break;
-
-        default:
-          console.warn("Unknown message type:", message.type);
+    // Validate message first
+    const validation = validateMessage(parsed);
+    if (!validation.ok) {
+      this.logger.warn(`Invalid message received: ${validation.error}`);
+      if (socket.writable) {
+        socket.write(encode(createErrorMessage(ErrorCode.BAD_MESSAGE, validation.error)));
       }
-    } catch (error) {
-      console.error("Error handling message:", error);
-      socket.write(encode(createErrorMessage(ErrorCode.BAD_MESSAGE, "Invalid message format")));
+      return;
+    }
+
+    const message = validation.message;
+
+    // Use type guards before processing
+    if (isChatStart(message)) {
+      this.handleChatStart(socket, message);
+    } else if (isAbort(message)) {
+      this.handleAbort(socket, message);
+    } else {
+      // Other valid message types (server_info, chat_chunk, etc.) are not expected from clients
+      this.logger.warn("Unexpected message type from client:", message.type);
     }
   }
 
@@ -134,33 +153,38 @@ export class StreamingRelay {
 
     this.logger.log(`Received chat_start for request ${request_id}`);
 
-    // Validate prompt size (max 8 KB)
-    if (payload.prompt.length > 8192) {
-      this.logger.warn(`Request ${request_id} rejected: prompt too large`);
-      socket.write(
-        encode(
-          createErrorMessage(
-            ErrorCode.BAD_MESSAGE,
-            "Prompt exceeds maximum size of 8 KB",
-            request_id,
+    // Validate prompt size (max 8 KB in bytes, not characters)
+    const promptBytes = Buffer.byteLength(payload.prompt, 'utf-8');
+    if (promptBytes > 8192) {
+      this.logger.warn(`Request ${request_id} rejected: prompt too large (${promptBytes} bytes)`);
+      if (socket.writable) {
+        socket.write(
+          encode(
+            createErrorMessage(
+              ErrorCode.BAD_MESSAGE,
+              "Prompt exceeds maximum size of 8 KB",
+              request_id,
+            ),
           ),
-        ),
-      );
+        );
+      }
       return;
     }
 
     // Try to acquire the concurrency gate
     if (!this.gate.acquire(request_id)) {
       this.logger.warn(`Request ${request_id} rejected: model busy`);
-      socket.write(
-        encode(
-          createErrorMessage(
-            ErrorCode.MODEL_BUSY,
-            "Host is processing another request",
-            request_id,
+      if (socket.writable) {
+        socket.write(
+          encode(
+            createErrorMessage(
+              ErrorCode.MODEL_BUSY,
+              "Host is processing another request",
+              request_id,
+            ),
           ),
-        ),
-      );
+        );
+      }
       return;
     }
 
@@ -177,21 +201,25 @@ export class StreamingRelay {
     // Start Ollama generation
     this.ollama.generate(request_id, this.config.model, payload.prompt, {
       onChunk: (text) => {
-        const chunk: ChatChunkMessage = {
-          type: "chat_chunk",
-          request_id,
-          payload: { text },
-        };
-        socket.write(encode(chunk));
+        if (socket.writable) {
+          const chunk: ChatChunkMessage = {
+            type: "chat_chunk",
+            request_id,
+            payload: { text },
+          };
+          socket.write(encode(chunk));
+        }
       },
 
       onEnd: () => {
-        const end: ChatEndMessage = {
-          type: "chat_end",
-          request_id,
-          payload: { finish_reason: "stop" },
-        };
-        socket.write(encode(end));
+        if (socket.writable) {
+          const end: ChatEndMessage = {
+            type: "chat_end",
+            request_id,
+            payload: { finish_reason: "stop" },
+          };
+          socket.write(encode(end));
+        }
         this.gate.release(request_id);
         this.socketMap.delete(socket);
 
@@ -202,7 +230,9 @@ export class StreamingRelay {
       },
 
       onError: (code, errorMessage) => {
-        socket.write(encode(createErrorMessage(code, errorMessage, request_id)));
+        if (socket.writable) {
+          socket.write(encode(createErrorMessage(code, errorMessage, request_id)));
+        }
         this.gate.release(request_id);
         this.socketMap.delete(socket);
 
@@ -235,12 +265,14 @@ export class StreamingRelay {
         this.gate.release(request_id);
         this.socketMap.delete(socket);
 
-        const end: ChatEndMessage = {
-          type: "chat_end",
-          request_id,
-          payload: { finish_reason: "abort" },
-        };
-        socket.write(encode(end));
+        if (socket.writable) {
+          const end: ChatEndMessage = {
+            type: "chat_end",
+            request_id,
+            payload: { finish_reason: "abort" },
+          };
+          socket.write(encode(end));
+        }
       }
     }
   }

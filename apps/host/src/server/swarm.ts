@@ -19,6 +19,8 @@ export class SwarmServer {
   private topic: Buffer | null = null;
   private serverId: string | null = null;
   private connectedSockets = new Set<Duplex>();
+  private handledDisconnections = new Set<Duplex>();
+  private stopped = false;
   private config: SwarmServerConfig;
   private logger: Logger;
 
@@ -34,6 +36,9 @@ export class SwarmServer {
     if (this.swarm) {
       throw new Error("Server already running");
     }
+
+    // Reset stopped flag when starting
+    this.stopped = false;
 
     // Generate random 32-byte topic
     this.topic = crypto.randomBytes(32);
@@ -68,12 +73,33 @@ export class SwarmServer {
       socket.on("close", () => {
         this.logger.log("Peer connection closed");
         this.connectedSockets.delete(socket);
+
+        // Skip if already handled (e.g., by error event)
+        if (this.handledDisconnections.has(socket)) {
+          this.handledDisconnections.delete(socket);
+          return;
+        }
+
+        // Skip callbacks if server is stopping to prevent stale callbacks
+        if (this.stopped) {
+          return;
+        }
+
         this.config.onDisconnection(socket);
       });
 
       socket.on("error", (error) => {
         this.logger.error("Socket error:", error);
         this.connectedSockets.delete(socket);
+
+        // Mark as handled to prevent double onDisconnection when 'close' fires
+        this.handledDisconnections.add(socket);
+
+        // Skip callbacks if server is stopping to prevent stale callbacks
+        if (this.stopped) {
+          return;
+        }
+
         this.config.onDisconnection(socket);
       });
     });
@@ -91,12 +117,16 @@ export class SwarmServer {
 
     this.logger.log("Stopping Hyperswarm server...");
 
+    // Set stopped flag to prevent stale callbacks from firing
+    this.stopped = true;
+
     // Close all connected sockets
     this.logger.log(`Closing ${this.connectedSockets.size} connected socket(s)`);
     for (const socket of this.connectedSockets) {
       socket.destroy();
     }
     this.connectedSockets.clear();
+    this.handledDisconnections.clear();
 
     // Leave the topic
     if (this.topic) {

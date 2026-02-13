@@ -80,8 +80,9 @@ class HostApp {
       this.logger.error("Ollama health check failed:", result.error);
       this.trayMenu.setState("error", "OLLAMA_NOT_FOUND");
     } else {
-      this.logger.log("Ollama is healthy - setting state to ready");
-      this.trayMenu.setState("ready");
+      this.logger.log("Ollama is healthy - keeping state as stopped until server starts");
+      // Keep state as "stopped" - only transition to "ready" when server actually starts
+      this.trayMenu.setState("stopped");
     }
   }
 
@@ -288,9 +289,14 @@ if (!app.requestSingleInstanceLock()) {
   app.on("before-quit", async (event) => {
     if (hostApp) {
       event.preventDefault();
-      await hostApp.cleanup();
-      hostApp = null;
-      app.exit(0);
+      try {
+        await hostApp.cleanup();
+      } catch (error) {
+        console.error("Error during cleanup:", error);
+      } finally {
+        hostApp = null;
+        app.exit(0);
+      }
     }
   });
 

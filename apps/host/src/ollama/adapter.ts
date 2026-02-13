@@ -143,7 +143,7 @@ export class OllamaAdapter {
                 return;
               }
             } catch (error) {
-              console.error("Failed to parse Ollama chunk:", error);
+              this.logger.error("Failed to parse Ollama chunk:", error);
             }
           }
         }
@@ -166,7 +166,8 @@ export class OllamaAdapter {
           if (wasTimeout) {
             callbacks.onError(ErrorCode.TIMEOUT_NO_RESPONSE, "No response from model for 30 seconds");
           } else {
-            callbacks.onError(ErrorCode.GENERATION_ABORTED, "Generation was aborted");
+            // Controller was already deleted - this abort was handled externally (by handleAbort).
+            // Do NOT call onError here to avoid double response.
           }
           return;
         }
