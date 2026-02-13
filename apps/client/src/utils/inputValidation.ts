@@ -22,7 +22,7 @@ export function isSendDisabled(input: {
   isGenerating: boolean;
   prompt: string;
 }): boolean {
-  const promptLength = input.prompt.trim().length;
+  const promptLength = new TextEncoder().encode(input.prompt.trim()).byteLength;
   return (
     input.isGenerating ||
     promptLength > MAX_PROMPT_SIZE ||

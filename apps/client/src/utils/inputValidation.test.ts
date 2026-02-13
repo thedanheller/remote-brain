@@ -23,4 +23,16 @@ describe("inputValidation", () => {
       }),
     ).toBe(true);
   });
+
+  test("prompt byte length uses UTF-8, not character count", () => {
+    const prompt = "😀".repeat(Math.floor(MAX_PROMPT_SIZE / 4) + 1);
+
+    expect(
+      isSendDisabled({
+        connectionState: "connected",
+        isGenerating: false,
+        prompt,
+      }),
+    ).toBe(true);
+  });
 });
