@@ -25,6 +25,10 @@ jest.mock("react-native-bare-kit", () => {
   };
 });
 
+jest.mock("../worklet/swarmWorkletBundle", () => ({
+  SWARM_WORKLET_BUNDLE: "mock-bundle-content",
+}));
+
 import { WorkletBridge } from "./workletBridge";
 
 function decodeCommandPayload(raw: Uint8Array): unknown {
@@ -35,7 +39,7 @@ function emitWorkletEvent(event: WorkletEvent): void {
   if (!dataHandler) {
     throw new Error("worklet data handler not registered");
   }
-  dataHandler(new TextEncoder().encode(JSON.stringify(event)));
+  dataHandler(new TextEncoder().encode(JSON.stringify(event) + "\n"));
 }
 
 describe("WorkletBridge", () => {
@@ -70,6 +74,21 @@ describe("WorkletBridge", () => {
     expect(mockWrite).toHaveBeenCalledTimes(2);
     const command = decodeCommandPayload(mockWrite.mock.calls[1][0] as Uint8Array);
     expect(command).toEqual({ type: "disconnect" });
+  });
+
+  test("connect forwards diagnostic mode for crash-isolation runs", () => {
+    const bridge = new WorkletBridge();
+    const serverId = bs58.encode(Uint8Array.from({ length: 32 }, (_, i) => i + 1));
+
+    bridge.connect(serverId, { diagnosticMode: "decode_only" });
+
+    expect(mockWrite).toHaveBeenCalledTimes(1);
+    const command = decodeCommandPayload(mockWrite.mock.calls[0][0] as Uint8Array);
+    expect(command).toEqual({
+      type: "connect",
+      topic: Array.from(bs58.decode(serverId)),
+      diagnosticMode: "decode_only",
+    });
   });
 
   test("forwards onChunk, onChatEnd and onError events to listener", () => {
