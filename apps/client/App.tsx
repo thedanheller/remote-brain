@@ -61,9 +61,11 @@ export default function App() {
   const bridgeRef = useRef<WorkletBridge | null>(null);
   const hostTapCount = useRef(0);
   const hostTapResetTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const sendLockRef = useRef(false);
+  const connectionStateRef = useRef<ConnectionState>("disconnected");
 
-  const promptLength = prompt.trim().length;
-  const promptTooLong = promptLength > MAX_PROMPT_SIZE;
+  const promptByteLength = new TextEncoder().encode(prompt.trim()).byteLength;
+  const promptTooLong = promptByteLength > MAX_PROMPT_SIZE;
 
   const appendRawMessage = (line: string) => {
     setRawMessageLog((previous) => {
@@ -77,11 +79,29 @@ export default function App() {
   };
 
   useEffect(() => {
+    connectionStateRef.current = connectionState;
+  }, [connectionState]);
+
+  useEffect(() => {
     const bridge = new WorkletBridge();
     bridgeRef.current = bridge;
 
     bridge.onEvent((event: WorkletEvent) => {
       if (event.type === "onRawMessage") {
+        if (event.direction === "out" && activeAssistant.current?.requestId === null) {
+          try {
+            const parsed = JSON.parse(event.text) as { type?: string; request_id?: string };
+            if (parsed.type === "chat_start" && typeof parsed.request_id === "string") {
+              activeAssistant.current = {
+                requestId: parsed.request_id,
+                index: activeAssistant.current.index,
+              };
+            }
+          } catch {
+            // Keep raw-message logging resilient to malformed debug payloads.
+          }
+        }
+
         const timestamp = new Date().toLocaleTimeString();
         appendRawMessage(`${timestamp} ${event.direction.toUpperCase()} ${event.text}`);
         return;
@@ -138,7 +158,7 @@ export default function App() {
 
       if (event.type === "onChatEnd") {
         const active = activeAssistant.current;
-        const matchesActiveRequest = !!active && (active.requestId === event.requestId || active.requestId === null);
+        const matchesActiveRequest = !!active && active.requestId === event.requestId;
 
         if (matchesActiveRequest && event.finishReason === "abort" && active) {
           setTranscript((previous) => {
@@ -156,8 +176,9 @@ export default function App() {
 
         if (matchesActiveRequest) {
           activeAssistant.current = null;
+          sendLockRef.current = false;
+          setIsGenerating(false);
         }
-        setIsGenerating(false);
         return;
       }
 
@@ -167,6 +188,9 @@ export default function App() {
 
         setConnectionError(nextError);
         setLastError(nextError);
+        if (connectionStateRef.current === "connecting") {
+          setConnectionState("disconnected");
+        }
 
         if (event.requestId && activeAssistant.current?.requestId === event.requestId) {
           setTranscript((previous) => {
@@ -186,6 +210,7 @@ export default function App() {
             return next;
           });
           activeAssistant.current = null;
+          sendLockRef.current = false;
           setIsGenerating(false);
         }
         return;
@@ -194,6 +219,7 @@ export default function App() {
       if (event.type === "onDisconnect") {
         setConnectionState("disconnected");
         setIsGenerating(false);
+        sendLockRef.current = false;
         activeAssistant.current = null;
 
         if (event.code !== ErrorCode.USER_DISCONNECTED) {
@@ -305,6 +331,7 @@ export default function App() {
     setConnectionError(null);
     setShowDisconnectedBanner(false);
     setIsGenerating(false);
+    sendLockRef.current = false;
     activeAssistant.current = null;
     setScreen("connect");
   };
@@ -320,9 +347,10 @@ export default function App() {
 
   const onSendPrompt = () => {
     const normalized = prompt.trim();
-    if (!normalized || promptTooLong || connectionState !== "connected" || isGenerating) {
+    if (!normalized || promptTooLong || connectionState !== "connected" || isGenerating || sendLockRef.current) {
       return;
     }
+    sendLockRef.current = true;
 
     setTranscript((previous) => {
       const assistantIndex = previous.length + 1;
@@ -345,6 +373,8 @@ export default function App() {
       return;
     }
 
+    sendLockRef.current = false;
+    setIsGenerating(false);
     bridgeRef.current?.abort();
   };
 
@@ -567,7 +597,7 @@ export default function App() {
         />
 
         {promptTooLong ? (
-          <Text style={styles.errorText}>Prompt exceeds {MAX_PROMPT_SIZE} characters. Shorten it to send.</Text>
+          <Text style={styles.errorText}>Prompt exceeds {MAX_PROMPT_SIZE} bytes (UTF-8). Shorten it to send.</Text>
         ) : null}
         {connectionError ? <Text style={styles.errorText}>{connectionError}</Text> : null}
 

@@ -5,7 +5,9 @@ const { IPC } = BareKit
 const Hyperswarm = require('hyperswarm')
 
 const MAX_PROMPT_SIZE = ${MAX_PROMPT_SIZE}
+const MAX_INBOUND_BUFFER_BYTES = 64 * 1024
 const SERVER_INFO_TIMEOUT_MS = 15000
+const REQUEST_TIMEOUT_MS = 30000
 
 let swarm = null
 let discovery = null
@@ -14,6 +16,7 @@ let inboundBuffer = ''
 let activeRequestId = null
 let closing = false
 let serverInfoTimeoutId = null
+let requestTimeoutId = null
 let serverInfoReceived = false
 
 function emit(event) {
@@ -49,6 +52,36 @@ function clearServerInfoTimeout() {
   }
 }
 
+function clearRequestTimeout() {
+  if (requestTimeoutId) {
+    clearTimeout(requestTimeoutId)
+    requestTimeoutId = null
+  }
+}
+
+function resetRequestTimeout() {
+  if (!activeRequestId) {
+    clearRequestTimeout()
+    return
+  }
+
+  const timedRequestId = activeRequestId
+  clearRequestTimeout()
+  requestTimeoutId = setTimeout(() => {
+    if (activeRequestId !== timedRequestId) {
+      return
+    }
+
+    activeRequestId = null
+    clearRequestTimeout()
+    emitError('${ErrorCode.TIMEOUT_NO_RESPONSE}', 'No response chunk received within 30 seconds', timedRequestId)
+  }, REQUEST_TIMEOUT_MS)
+}
+
+function emitProtocolError(message) {
+  emitError('${ErrorCode.BAD_MESSAGE}', message, activeRequestId || undefined)
+}
+
 function startServerInfoTimeout(targetSocket) {
   clearServerInfoTimeout()
   serverInfoTimeoutId = setTimeout(async () => {
@@ -73,6 +106,7 @@ async function closeResources() {
 
   closing = true
   clearServerInfoTimeout()
+  clearRequestTimeout()
   serverInfoReceived = false
 
   const previousSocket = socket
@@ -118,12 +152,12 @@ function handleProtocolLine(line) {
   try {
     message = JSON.parse(line)
   } catch {
-    emitError('${ErrorCode.BAD_MESSAGE}', 'Malformed protocol payload')
+    emitProtocolError('Malformed protocol payload')
     return
   }
 
   if (!message || typeof message.type !== 'string') {
-    emitError('${ErrorCode.BAD_MESSAGE}', 'Protocol message missing type')
+    emitProtocolError('Protocol message missing type')
     return
   }
 
@@ -146,7 +180,7 @@ function handleProtocolLine(line) {
       return
     }
 
-    emitError('${ErrorCode.BAD_MESSAGE}', 'Invalid server_info payload')
+    emitProtocolError('Invalid server_info payload')
     return
   }
 
@@ -155,6 +189,10 @@ function handleProtocolLine(line) {
     const payload = message.payload
 
     if (typeof requestId === 'string' && payload && typeof payload.text === 'string') {
+      if (activeRequestId === requestId) {
+        resetRequestTimeout()
+      }
+
       emit({
         type: 'onChunk',
         requestId,
@@ -163,7 +201,7 @@ function handleProtocolLine(line) {
       return
     }
 
-    emitError('${ErrorCode.BAD_MESSAGE}', 'Invalid chat_chunk payload')
+    emitProtocolError('Invalid chat_chunk payload')
     return
   }
 
@@ -178,6 +216,7 @@ function handleProtocolLine(line) {
     ) {
       if (activeRequestId === requestId) {
         activeRequestId = null
+        clearRequestTimeout()
       }
 
       emit({
@@ -188,7 +227,7 @@ function handleProtocolLine(line) {
       return
     }
 
-    emitError('${ErrorCode.BAD_MESSAGE}', 'Invalid chat_end payload')
+    emitProtocolError('Invalid chat_end payload')
     return
   }
 
@@ -199,21 +238,37 @@ function handleProtocolLine(line) {
       const requestId = typeof message.request_id === 'string' ? message.request_id : undefined
       if (requestId && activeRequestId === requestId) {
         activeRequestId = null
+        clearRequestTimeout()
       }
 
       emitError(payload.code, payload.message, requestId)
       return
     }
 
-    emitError('${ErrorCode.BAD_MESSAGE}', 'Invalid error payload')
+    emitProtocolError('Invalid error payload')
     return
   }
 
-  emitError('${ErrorCode.BAD_MESSAGE}', 'Unsupported protocol message type')
+  emitProtocolError('Unsupported protocol message type')
 }
 
-function onSocketData(chunk) {
+async function disconnectForBadInboundBuffer() {
+  emitError('${ErrorCode.BAD_MESSAGE}', 'Inbound protocol buffer exceeded 64 KB', activeRequestId || undefined)
+  await closeResources()
+  emit({
+    type: 'onDisconnect',
+    code: '${ErrorCode.BAD_MESSAGE}',
+    message: 'Disconnected due to malformed protocol stream'
+  })
+}
+
+async function onSocketData(chunk) {
   inboundBuffer += chunk.toString()
+
+  if (Buffer.byteLength(inboundBuffer, 'utf8') > MAX_INBOUND_BUFFER_BYTES) {
+    await disconnectForBadInboundBuffer()
+    return
+  }
 
   while (true) {
     const newlineIndex = inboundBuffer.indexOf('\n')
@@ -319,7 +374,8 @@ function handleSendPrompt(prompt) {
     return
   }
 
-  if (normalized.length > MAX_PROMPT_SIZE) {
+  const promptByteLength = new TextEncoder().encode(normalized).byteLength
+  if (promptByteLength > MAX_PROMPT_SIZE) {
     emitError('${ErrorCode.BAD_MESSAGE}', 'Prompt exceeds max size')
     return
   }
@@ -345,8 +401,9 @@ function handleSendPrompt(prompt) {
     emitRawMessage('out', message.trim())
     socket.write(message)
     activeRequestId = requestId
+    resetRequestTimeout()
   } catch {
-    emitError('${ErrorCode.HOST_DISCONNECTED}', 'Failed to write to host peer')
+    emitError('${ErrorCode.HOST_DISCONNECTED}', 'Failed to write to host peer', requestId)
   }
 }
 
@@ -364,6 +421,8 @@ function handleAbort() {
   try {
     emitRawMessage('out', message.trim())
     socket.write(message)
+    activeRequestId = null
+    clearRequestTimeout()
   } catch {
     emitError('${ErrorCode.HOST_DISCONNECTED}', 'Failed to send abort', requestId)
   }

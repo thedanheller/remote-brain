@@ -62,6 +62,21 @@ describe("ProtocolClient", () => {
     });
   });
 
+  test("sendChatStart rejects prompts that exceed UTF-8 byte limit", () => {
+    const transport = createTransportMock();
+    const handlers = {
+      onConnectionState: jest.fn(),
+      onEvent: jest.fn(),
+    };
+    const client = new ProtocolClient(transport as unknown as BareSwarmTransport, handlers);
+    const prompt = "😀".repeat(2049);
+
+    const result = client.sendChatStart(prompt);
+
+    expect(result).toEqual({ ok: false, error: "Prompt exceeds 8 KB limit" });
+    expect(transport.sendLine).not.toHaveBeenCalled();
+  });
+
   test("incoming chat_chunk resets 30s timeout guard", () => {
     const transport = createTransportMock();
     const handlers = {

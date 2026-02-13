@@ -25,6 +25,7 @@ export class ProtocolClient {
   private readonly transport: BareSwarmTransport;
   private readonly handlers: ClientHandlers;
   private readonly decoder;
+  private readonly encoder = new TextEncoder();
 
   private activeRequestId: string | null = null;
   private timeoutId: ReturnType<typeof setTimeout> | null = null;
@@ -63,7 +64,7 @@ export class ProtocolClient {
       return { ok: false, error: "Prompt cannot be empty" };
     }
 
-    if (sanitized.length > MAX_PROMPT_SIZE) {
+    if (this.encoder.encode(sanitized).byteLength > MAX_PROMPT_SIZE) {
       return { ok: false, error: "Prompt exceeds 8 KB limit" };
     }
 
