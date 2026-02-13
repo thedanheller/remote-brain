@@ -2,7 +2,6 @@ import { ErrorCode, MAX_PROMPT_SIZE } from "@localllm/protocol";
 
 export const SWARM_WORKLET_SOURCE = `
 const { IPC } = BareKit
-const Hyperswarm = require('hyperswarm')
 
 const MAX_PROMPT_SIZE = ${MAX_PROMPT_SIZE}
 const MAX_INBOUND_BUFFER_BYTES = 64 * 1024
@@ -12,15 +11,170 @@ const REQUEST_TIMEOUT_MS = 30000
 let swarm = null
 let discovery = null
 let socket = null
+let HyperswarmFactory = null
+let SafeHyperswarmFactory = null
 let inboundBuffer = ''
 let activeRequestId = null
 let closing = false
 let serverInfoTimeoutId = null
 let requestTimeoutId = null
 let serverInfoReceived = false
+let unhandledHooksInstalled = false
+let bareHooksInstalled = false
 
 function emit(event) {
-  IPC.write(Buffer.from(JSON.stringify(event)))
+  try {
+    IPC.write(Buffer.from(JSON.stringify(event)))
+  } catch {}
+}
+
+function toErrorMessage(value) {
+  if (value && typeof value === 'object' && typeof value.message === 'string') {
+    return value.message
+  }
+
+  if (typeof value === 'string') {
+    return value
+  }
+
+  try {
+    return JSON.stringify(value)
+  } catch {
+    return 'Unknown error'
+  }
+}
+
+function handleThenable(result, onReject) {
+  if (!result || typeof result.then !== 'function') {
+    return false
+  }
+
+  result.catch((error) => {
+    try {
+      onReject(error)
+    } catch {}
+  })
+
+  return true
+}
+
+function guarded(fn, code, fallbackMessage) {
+  return (...args) => {
+    try {
+      const result = fn(...args)
+      if (result && typeof result.then === 'function') {
+        result.catch((error) => {
+          emitError(code, fallbackMessage + ': ' + toErrorMessage(error), activeRequestId || undefined)
+        })
+      }
+    } catch (error) {
+      emitError(code, fallbackMessage + ': ' + toErrorMessage(error), activeRequestId || undefined)
+    }
+  }
+}
+
+function resolveUnhandledReason(eventOrReason) {
+  if (eventOrReason !== null && typeof eventOrReason === 'object' && 'reason' in eventOrReason) {
+    return eventOrReason.reason
+  }
+
+  return eventOrReason
+}
+
+function reportUnhandledRejection(eventOrReason) {
+  try {
+    emitError(
+      '${ErrorCode.CONNECT_FAILED}',
+      'Worklet unhandled rejection: ' + toErrorMessage(resolveUnhandledReason(eventOrReason)),
+      activeRequestId || undefined
+    )
+  } catch {}
+}
+
+function reportUncaughtException(error) {
+  try {
+    emitError(
+      '${ErrorCode.CONNECT_FAILED}',
+      'Worklet uncaught exception: ' + toErrorMessage(error),
+      activeRequestId || undefined
+    )
+  } catch {}
+}
+
+function getBareRuntime() {
+  if (typeof globalThis !== 'undefined' && globalThis && globalThis.Bare) {
+    return globalThis.Bare
+  }
+
+  if (typeof Bare !== 'undefined') {
+    return Bare
+  }
+
+  return null
+}
+
+function installUnhandledHooks() {
+  if (unhandledHooksInstalled) {
+    return
+  }
+
+  unhandledHooksInstalled = true
+
+  const bareRuntime = getBareRuntime()
+  if (
+    !bareHooksInstalled &&
+    bareRuntime &&
+    typeof bareRuntime.on === 'function'
+  ) {
+    bareHooksInstalled = true
+    bareRuntime.on('unhandledRejection', (reason) => {
+      reportUnhandledRejection(reason)
+    })
+    bareRuntime.on('uncaughtException', (error) => {
+      reportUncaughtException(error)
+    })
+  }
+
+  if (typeof globalThis !== 'undefined') {
+    const handleUnhandledRejection = (event) => {
+      try {
+        if (event && typeof event === 'object' && typeof event.preventDefault === 'function') {
+          event.preventDefault()
+        }
+      } catch {}
+
+      reportUnhandledRejection(event)
+    }
+
+    if (typeof globalThis.addEventListener === 'function') {
+      try {
+        globalThis.addEventListener('unhandledrejection', handleUnhandledRejection)
+      } catch {}
+    }
+
+    globalThis.onunhandledrejection = handleUnhandledRejection
+
+    globalThis.onerror = (message) => {
+      try {
+        emitError(
+          '${ErrorCode.CONNECT_FAILED}',
+          'Worklet runtime error: ' + toErrorMessage(message),
+          activeRequestId || undefined
+        )
+      } catch {}
+      return true
+    }
+  }
+
+  if (typeof process !== 'undefined' && process && typeof process.on === 'function') {
+    process.on('unhandledRejection', (reason) => {
+      reportUnhandledRejection(reason)
+    })
+
+    process.on('uncaughtException', (error) => {
+      reportUncaughtException(error)
+    })
+  }
 }
 
 function emitError(code, message, requestId) {
@@ -43,6 +197,93 @@ function emitRawMessage(direction, text) {
     direction,
     text
   })
+}
+
+function suppressRejection(result) {
+  handleThenable(result, () => {})
+}
+
+function destroySocket(targetSocket) {
+  if (!targetSocket) {
+    return
+  }
+
+  try {
+    suppressRejection(targetSocket.destroy())
+  } catch {}
+}
+
+function attachDiscoveryErrorHandler(value) {
+  const target = value && value.discovery ? value.discovery : value
+  if (!target || typeof target !== 'object') {
+    return
+  }
+
+  try {
+    target._onerror = (error) => {
+      emitError('${ErrorCode.CONNECT_FAILED}', 'Discovery error: ' + toErrorMessage(error))
+    }
+  } catch {}
+}
+
+function getSafeHyperswarmFactory(factory) {
+  if (SafeHyperswarmFactory) {
+    return SafeHyperswarmFactory
+  }
+
+  SafeHyperswarmFactory = class SafeHyperswarm extends factory {
+    async _handleNetworkUpdate(...args) {
+      try {
+        return await super._handleNetworkUpdate(...args)
+      } catch (error) {
+        emitError('${ErrorCode.CONNECT_FAILED}', 'Swarm network update failed: ' + toErrorMessage(error))
+        return false
+      }
+    }
+
+    async _handleNetworkChange(...args) {
+      try {
+        return await super._handleNetworkChange(...args)
+      } catch (error) {
+        emitError('${ErrorCode.CONNECT_FAILED}', 'Swarm network change failed: ' + toErrorMessage(error))
+        return false
+      }
+    }
+
+    join(topic, opts = {}) {
+      const session = super.join(topic, opts)
+      attachDiscoveryErrorHandler(session)
+      return session
+    }
+  }
+
+  return SafeHyperswarmFactory
+}
+
+function writeSocketMessage(targetSocket, message, requestId, failureMessage) {
+  try {
+    const writeResult = targetSocket.write(message)
+    handleThenable(writeResult, (error) => {
+      if (requestId && activeRequestId === requestId) {
+        activeRequestId = null
+        clearRequestTimeout()
+      }
+
+      emitError(
+        '${ErrorCode.HOST_DISCONNECTED}',
+        failureMessage + ': ' + toErrorMessage(error),
+        requestId
+      )
+    })
+    return true
+  } catch (error) {
+    emitError(
+      '${ErrorCode.HOST_DISCONNECTED}',
+      failureMessage + ': ' + toErrorMessage(error),
+      requestId
+    )
+    return false
+  }
 }
 
 function clearServerInfoTimeout() {
@@ -84,22 +325,22 @@ function emitProtocolError(message) {
 
 function startServerInfoTimeout(targetSocket) {
   clearServerInfoTimeout()
-  serverInfoTimeoutId = setTimeout(async () => {
+  serverInfoTimeoutId = setTimeout(guarded(() => {
     if (socket !== targetSocket || serverInfoReceived) {
       return
     }
 
     emitError('${ErrorCode.TIMEOUT_NO_RESPONSE}', 'No server_info received within 15 seconds')
-    await closeResources()
+    closeResources()
     emit({
       type: 'onDisconnect',
       code: '${ErrorCode.TIMEOUT_NO_RESPONSE}',
       message: 'Connection timed out'
     })
-  }, SERVER_INFO_TIMEOUT_MS)
+  }, '${ErrorCode.CONNECT_FAILED}', 'Failed while waiting for server info'), SERVER_INFO_TIMEOUT_MS)
 }
 
-async function closeResources() {
+function closeResources() {
   if (closing) {
     return
   }
@@ -119,21 +360,19 @@ async function closeResources() {
       previousSocket.removeAllListeners()
     } catch {}
 
-    try {
-      previousSocket.destroy()
-    } catch {}
+    destroySocket(previousSocket)
   }
 
   if (discovery) {
     try {
-      await discovery.destroy()
+      suppressRejection(discovery.destroy())
     } catch {}
     discovery = null
   }
 
   if (swarm) {
     try {
-      await swarm.destroy()
+      suppressRejection(swarm.destroy())
     } catch {}
     swarm = null
   }
@@ -252,9 +491,9 @@ function handleProtocolLine(line) {
   emitProtocolError('Unsupported protocol message type')
 }
 
-async function disconnectForBadInboundBuffer() {
+function disconnectForBadInboundBuffer() {
   emitError('${ErrorCode.BAD_MESSAGE}', 'Inbound protocol buffer exceeded 64 KB', activeRequestId || undefined)
-  await closeResources()
+  closeResources()
   emit({
     type: 'onDisconnect',
     code: '${ErrorCode.BAD_MESSAGE}',
@@ -262,11 +501,11 @@ async function disconnectForBadInboundBuffer() {
   })
 }
 
-async function onSocketData(chunk) {
+function onSocketData(chunk) {
   inboundBuffer += chunk.toString()
 
   if (Buffer.byteLength(inboundBuffer, 'utf8') > MAX_INBOUND_BUFFER_BYTES) {
-    await disconnectForBadInboundBuffer()
+    disconnectForBadInboundBuffer()
     return
   }
 
@@ -289,7 +528,7 @@ async function onSocketData(chunk) {
 
 function attachSocket(nextSocket) {
   if (socket) {
-    nextSocket.destroy()
+    destroySocket(nextSocket)
     return
   }
 
@@ -297,37 +536,37 @@ function attachSocket(nextSocket) {
   serverInfoReceived = false
   startServerInfoTimeout(nextSocket)
 
-  nextSocket.on('data', onSocketData)
+  nextSocket.on('data', guarded(onSocketData, '${ErrorCode.BAD_MESSAGE}', 'Failed handling socket data'))
 
-  nextSocket.on('close', async () => {
+  nextSocket.on('close', guarded(() => {
     if (closing || socket !== nextSocket) {
       return
     }
 
-    await closeResources()
+    closeResources()
     emit({
       type: 'onDisconnect',
       code: '${ErrorCode.HOST_DISCONNECTED}',
       message: 'Host disconnected'
     })
-  })
+  }, '${ErrorCode.HOST_DISCONNECTED}', 'Socket close handler failed'))
 
-  nextSocket.on('error', async () => {
+  nextSocket.on('error', guarded(() => {
     if (closing || socket !== nextSocket) {
       return
     }
 
-    await closeResources()
+    closeResources()
     emit({
       type: 'onDisconnect',
       code: '${ErrorCode.HOST_DISCONNECTED}',
       message: 'Connection error'
     })
-  })
+  }, '${ErrorCode.HOST_DISCONNECTED}', 'Socket error handler failed'))
 }
 
-async function handleConnect(topicBytes) {
-  await closeResources()
+function handleConnect(topicBytes) {
+  closeResources()
 
   if (!Array.isArray(topicBytes)) {
     emitError('${ErrorCode.INVALID_SERVER_ID}', 'Topic must be an array of bytes')
@@ -344,21 +583,37 @@ async function handleConnect(topicBytes) {
   const topic = Buffer.from(topicBytes)
 
   try {
-    swarm = new Hyperswarm()
+    if (!HyperswarmFactory) {
+      HyperswarmFactory = require('hyperswarm')
+    }
+  } catch (error) {
+    emitError('${ErrorCode.CONNECT_FAILED}', 'Failed to load Hyperswarm: ' + toErrorMessage(error))
+    return
+  }
 
-    swarm.on('connection', (nextSocket) => {
+  try {
+    const HyperswarmCtor = getSafeHyperswarmFactory(HyperswarmFactory)
+    swarm = new HyperswarmCtor()
+
+    swarm.on('connection', guarded((nextSocket) => {
       attachSocket(nextSocket)
-    })
+    }, '${ErrorCode.CONNECT_FAILED}', 'Failed to attach socket'))
 
-    swarm.on('error', () => {
-      emitError('${ErrorCode.CONNECT_FAILED}', 'Failed to start Hyperswarm client')
-    })
+    swarm.on('error', guarded((error) => {
+      emitError('${ErrorCode.CONNECT_FAILED}', 'Failed to start Hyperswarm client: ' + toErrorMessage(error))
+    }, '${ErrorCode.CONNECT_FAILED}', 'Swarm error handler failed'))
 
     discovery = swarm.join(topic, { server: false, client: true })
-    await discovery.flushed()
-  } catch {
-    await closeResources()
-    emitError('${ErrorCode.CONNECT_FAILED}', 'Failed to join host topic')
+    attachDiscoveryErrorHandler(discovery)
+    suppressRejection(
+      discovery.flushed().catch(() => {
+        closeResources()
+        emitError('${ErrorCode.CONNECT_FAILED}', 'Failed to join host topic')
+      })
+    )
+  } catch (error) {
+    closeResources()
+    emitError('${ErrorCode.CONNECT_FAILED}', 'Failed to join host topic: ' + toErrorMessage(error))
   }
 }
 
@@ -399,12 +654,12 @@ function handleSendPrompt(prompt) {
 
   try {
     emitRawMessage('out', message.trim())
-    socket.write(message)
+    if (!writeSocketMessage(socket, message, requestId, 'Failed to write to host peer')) {
+      return
+    }
     activeRequestId = requestId
     resetRequestTimeout()
-  } catch {
-    emitError('${ErrorCode.HOST_DISCONNECTED}', 'Failed to write to host peer', requestId)
-  }
+  } catch {}
 }
 
 function handleAbort() {
@@ -420,15 +675,17 @@ function handleAbort() {
 
   try {
     emitRawMessage('out', message.trim())
-    socket.write(message)
+    if (!writeSocketMessage(socket, message, requestId, 'Failed to send abort')) {
+      return
+    }
     activeRequestId = null
     clearRequestTimeout()
-  } catch {
-    emitError('${ErrorCode.HOST_DISCONNECTED}', 'Failed to send abort', requestId)
-  }
+  } catch {}
 }
 
-IPC.on('data', async (chunk) => {
+installUnhandledHooks()
+
+IPC.on('data', guarded((chunk) => {
   let command
   try {
     command = JSON.parse(Buffer.from(chunk).toString())
@@ -443,12 +700,12 @@ IPC.on('data', async (chunk) => {
   }
 
   if (command.type === 'connect') {
-    await handleConnect(command.topic)
+    handleConnect(command.topic)
     return
   }
 
   if (command.type === 'disconnect') {
-    await closeResources()
+    closeResources()
     emit({
       type: 'onDisconnect',
       code: '${ErrorCode.USER_DISCONNECTED}',
@@ -468,5 +725,5 @@ IPC.on('data', async (chunk) => {
   }
 
   emitError('${ErrorCode.BAD_MESSAGE}', 'Unknown worklet command')
-})
+}, '${ErrorCode.BAD_MESSAGE}', 'Worklet command handler failed'))
 `;
