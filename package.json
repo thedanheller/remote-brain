@@ -11,6 +11,10 @@
     "test:host": "npm run test -w @localllm/host",
     "test:protocol": "npm run test -w @localllm/protocol",
     "test": "npm run test -w @localllm/protocol && npm run test -w @localllm/host && npm run test -w client",
-    "build": "npm run build -w @localllm/protocol && npm run build -w @localllm/host & npm run build -w client & wait"
+    "build": "npm run build -w @localllm/protocol && npm run build -w @localllm/host & npm run build -w client & wait",
+    "postinstall": "patch-package"
+  },
+  "devDependencies": {
+    "patch-package": "^8.0.1"
   }
 }

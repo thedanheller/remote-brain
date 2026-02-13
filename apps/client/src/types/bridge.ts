@@ -1,5 +1,7 @@
+export type ConnectDiagnosticMode = "full" | "decode_only" | "join_only";
+
 export type BridgeCommand =
-  | { type: "connect"; topic: number[] }
+  | { type: "connect"; topic: number[]; diagnosticMode?: ConnectDiagnosticMode }
   | { type: "disconnect" }
   | { type: "sendPrompt"; prompt: string }
   | { type: "abort" };

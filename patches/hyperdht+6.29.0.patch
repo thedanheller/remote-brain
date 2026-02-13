@@ -1,0 +1,13 @@
+diff --git a/node_modules/hyperdht/lib/connect.js b/node_modules/hyperdht/lib/connect.js
+index 3751c6c..a98ef81 100644
+--- a/node_modules/hyperdht/lib/connect.js
++++ b/node_modules/hyperdht/lib/connect.js
+@@ -726,7 +726,7 @@ function maybeDestroyEncryptedSocket(c, err) {
+ 
+ async function abort(c, { peerAddress, relayAddress }, err) {
+   try {
+-    await updateHolepunch(peerAddress, relayAddress, {
++    await updateHolepunch(c, peerAddress, relayAddress, {
+       error: ERROR.ABORTED,
+       firewall: FIREWALL.UNKNOWN,
+       round: c.round++,

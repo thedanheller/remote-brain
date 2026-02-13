@@ -7,6 +7,13 @@ const MAX_PROMPT_SIZE = ${MAX_PROMPT_SIZE}
 const MAX_INBOUND_BUFFER_BYTES = 64 * 1024
 const SERVER_INFO_TIMEOUT_MS = 15000
 const REQUEST_TIMEOUT_MS = 30000
+const BARE_HOOK_RETRY_MAX_ATTEMPTS = 20
+const BREADCRUMB_BUFFER_SIZE = 120
+const BREADCRUMB_DUMP_LIMIT = 80
+const DIAGNOSTIC_PREFIX = '[worklet-diag]'
+const CONNECT_DIAGNOSTIC_PHASE_FULL = 'full'
+const CONNECT_DIAGNOSTIC_PHASE_DECODE_ONLY = 'decode_only'
+const CONNECT_DIAGNOSTIC_PHASE_JOIN_ONLY = 'join_only'
 
 let swarm = null
 let discovery = null
@@ -21,11 +28,74 @@ let requestTimeoutId = null
 let serverInfoReceived = false
 let unhandledHooksInstalled = false
 let bareHooksInstalled = false
+let promiseSafetyNetInstalled = false
+let bareHookRetryScheduled = false
+let bareHookRetryAttempts = 0
+let connectDiagnosticPhase = CONNECT_DIAGNOSTIC_PHASE_FULL
+let breadcrumbSequence = 0
+let breadcrumbBuffer = []
+let breadcrumbDumped = false
 
 function emit(event) {
   try {
-    IPC.write(Buffer.from(JSON.stringify(event)))
+    IPC.write(Buffer.from(JSON.stringify(event) + '\\n'))
   } catch {}
+}
+
+function normalizeDiagnosticPhase(value) {
+  if (value === CONNECT_DIAGNOSTIC_PHASE_DECODE_ONLY) {
+    return CONNECT_DIAGNOSTIC_PHASE_DECODE_ONLY
+  }
+
+  if (value === CONNECT_DIAGNOSTIC_PHASE_JOIN_ONLY) {
+    return CONNECT_DIAGNOSTIC_PHASE_JOIN_ONLY
+  }
+
+  return CONNECT_DIAGNOSTIC_PHASE_FULL
+}
+
+function setDiagnosticPhase(value) {
+  connectDiagnosticPhase = normalizeDiagnosticPhase(value)
+  addBreadcrumb('connect.phase', connectDiagnosticPhase)
+}
+
+function addBreadcrumb(edge, detail) {
+  const entry = {
+    seq: ++breadcrumbSequence,
+    t: Date.now(),
+    edge
+  }
+
+  if (detail !== undefined) {
+    entry.detail = detail
+  }
+
+  breadcrumbBuffer.push(entry)
+  if (breadcrumbBuffer.length > BREADCRUMB_BUFFER_SIZE) {
+    breadcrumbBuffer.shift()
+  }
+}
+
+function dumpBreadcrumbsOnce(trigger, detail) {
+  if (breadcrumbDumped) {
+    return
+  }
+
+  breadcrumbDumped = true
+  const payload = {
+    type: 'worklet_failure_breadcrumbs',
+    trigger,
+    detail,
+    phase: connectDiagnosticPhase,
+    requestId: activeRequestId || null,
+    breadcrumbs: breadcrumbBuffer.slice(-BREADCRUMB_DUMP_LIMIT)
+  }
+
+  emit({
+    type: 'onRawMessage',
+    direction: 'out',
+    text: DIAGNOSTIC_PREFIX + ' ' + JSON.stringify(payload)
+  })
 }
 
 function toErrorMessage(value) {
@@ -49,7 +119,9 @@ function handleThenable(result, onReject) {
     return false
   }
 
+  addBreadcrumb('promise.observe')
   result.catch((error) => {
+    addBreadcrumb('promise.reject', toErrorMessage(error))
     try {
       onReject(error)
     } catch {}
@@ -60,14 +132,18 @@ function handleThenable(result, onReject) {
 
 function guarded(fn, code, fallbackMessage) {
   return (...args) => {
+    addBreadcrumb('callback.enter', fallbackMessage)
     try {
       const result = fn(...args)
       if (result && typeof result.then === 'function') {
+        addBreadcrumb('callback.promise', fallbackMessage)
         result.catch((error) => {
+          addBreadcrumb('callback.reject', fallbackMessage + ': ' + toErrorMessage(error))
           emitError(code, fallbackMessage + ': ' + toErrorMessage(error), activeRequestId || undefined)
         })
       }
     } catch (error) {
+      addBreadcrumb('callback.throw', fallbackMessage + ': ' + toErrorMessage(error))
       emitError(code, fallbackMessage + ': ' + toErrorMessage(error), activeRequestId || undefined)
     }
   }
@@ -82,6 +158,7 @@ function resolveUnhandledReason(eventOrReason) {
 }
 
 function reportUnhandledRejection(eventOrReason) {
+  addBreadcrumb('unhandledRejection', toErrorMessage(resolveUnhandledReason(eventOrReason)))
   try {
     emitError(
       '${ErrorCode.CONNECT_FAILED}',
@@ -92,6 +169,7 @@ function reportUnhandledRejection(eventOrReason) {
 }
 
 function reportUncaughtException(error) {
+  addBreadcrumb('uncaughtException', toErrorMessage(error))
   try {
     emitError(
       '${ErrorCode.CONNECT_FAILED}',
@@ -113,13 +191,22 @@ function getBareRuntime() {
   return null
 }
 
-function installUnhandledHooks() {
-  if (unhandledHooksInstalled) {
+function scheduleBareHookRetry() {
+  if (bareHooksInstalled || bareHookRetryScheduled || bareHookRetryAttempts >= BARE_HOOK_RETRY_MAX_ATTEMPTS) {
     return
   }
 
-  unhandledHooksInstalled = true
+  addBreadcrumb('hooks.bare.retry.schedule', bareHookRetryAttempts + 1)
+  bareHookRetryScheduled = true
+  setTimeout(() => {
+    bareHookRetryScheduled = false
+    bareHookRetryAttempts += 1
+    addBreadcrumb('hooks.bare.retry.run', bareHookRetryAttempts)
+    installUnhandledHooks()
+  }, 0)
+}
 
+function installUnhandledHooks() {
   const bareRuntime = getBareRuntime()
   if (
     !bareHooksInstalled &&
@@ -127,13 +214,33 @@ function installUnhandledHooks() {
     typeof bareRuntime.on === 'function'
   ) {
     bareHooksInstalled = true
+    addBreadcrumb('hooks.bare.installed')
     bareRuntime.on('unhandledRejection', (reason) => {
       reportUnhandledRejection(reason)
+      return true
+    })
+    bareRuntime.on('unhandledrejection', (reason) => {
+      reportUnhandledRejection(reason)
+      return true
     })
     bareRuntime.on('uncaughtException', (error) => {
       reportUncaughtException(error)
+      return true
     })
+    bareRuntime.on('uncaughtexception', (error) => {
+      reportUncaughtException(error)
+      return true
+    })
+  } else if (!bareHooksInstalled) {
+    scheduleBareHookRetry()
   }
+
+  if (unhandledHooksInstalled) {
+    return
+  }
+
+  unhandledHooksInstalled = true
+  addBreadcrumb('hooks.global.installed')
 
   if (typeof globalThis !== 'undefined') {
     const handleUnhandledRejection = (event) => {
@@ -144,6 +251,7 @@ function installUnhandledHooks() {
       } catch {}
 
       reportUnhandledRejection(event)
+      return true
     }
 
     if (typeof globalThis.addEventListener === 'function') {
@@ -152,18 +260,22 @@ function installUnhandledHooks() {
       } catch {}
     }
 
-    globalThis.onunhandledrejection = handleUnhandledRejection
+    try {
+      globalThis.onunhandledrejection = handleUnhandledRejection
+    } catch {}
 
-    globalThis.onerror = (message) => {
-      try {
-        emitError(
-          '${ErrorCode.CONNECT_FAILED}',
-          'Worklet runtime error: ' + toErrorMessage(message),
-          activeRequestId || undefined
-        )
-      } catch {}
-      return true
-    }
+    try {
+      globalThis.onerror = (message) => {
+        try {
+          emitError(
+            '${ErrorCode.CONNECT_FAILED}',
+            'Worklet runtime error: ' + toErrorMessage(message),
+            activeRequestId || undefined
+          )
+        } catch {}
+        return true
+      }
+    } catch {}
   }
 
   if (typeof process !== 'undefined' && process && typeof process.on === 'function') {
@@ -177,7 +289,35 @@ function installUnhandledHooks() {
   }
 }
 
+function installPromiseSafetyNet() {
+  if (promiseSafetyNetInstalled || typeof Promise === 'undefined' || !Promise || !Promise.prototype) {
+    return
+  }
+
+  const originalThen = Promise.prototype.then
+  if (typeof originalThen !== 'function') {
+    return
+  }
+
+  promiseSafetyNetInstalled = true
+  addBreadcrumb('hooks.promise.patch')
+
+  Promise.prototype.then = function patchedThen(onFulfilled, onRejected) {
+    const next = originalThen.call(this, onFulfilled, onRejected)
+
+    try {
+      // Mark chained promises as observed to avoid fatal unhandled-rejection aborts in Bare.
+      originalThen.call(next, undefined, () => {})
+    } catch {}
+
+    return next
+  }
+}
+
 function emitError(code, message, requestId) {
+  addBreadcrumb('emit.error', code + ': ' + message)
+  dumpBreadcrumbsOnce('emitError', code + ': ' + message)
+
   const payload = {
     type: 'onError',
     code,
@@ -200,6 +340,7 @@ function emitRawMessage(direction, text) {
 }
 
 function suppressRejection(result) {
+  addBreadcrumb('promise.suppress')
   handleThenable(result, () => {})
 }
 
@@ -208,6 +349,7 @@ function destroySocket(targetSocket) {
     return
   }
 
+  addBreadcrumb('socket.destroy')
   try {
     suppressRejection(targetSocket.destroy())
   } catch {}
@@ -220,10 +362,17 @@ function attachDiscoveryErrorHandler(value) {
   }
 
   try {
+    addBreadcrumb('discovery.onerror.patch')
     target._onerror = (error) => {
+      addBreadcrumb('discovery.onerror.callback', toErrorMessage(error))
       emitError('${ErrorCode.CONNECT_FAILED}', 'Discovery error: ' + toErrorMessage(error))
     }
   } catch {}
+}
+
+function onDiscoveryError(error) {
+  addBreadcrumb('discovery.onerror.option', toErrorMessage(error))
+  emitError('${ErrorCode.CONNECT_FAILED}', 'Discovery error: ' + toErrorMessage(error))
 }
 
 function getSafeHyperswarmFactory(factory) {
@@ -234,8 +383,10 @@ function getSafeHyperswarmFactory(factory) {
   SafeHyperswarmFactory = class SafeHyperswarm extends factory {
     async _handleNetworkUpdate(...args) {
       try {
+        addBreadcrumb('swarm.networkUpdate.start')
         return await super._handleNetworkUpdate(...args)
       } catch (error) {
+        addBreadcrumb('swarm.networkUpdate.error', toErrorMessage(error))
         emitError('${ErrorCode.CONNECT_FAILED}', 'Swarm network update failed: ' + toErrorMessage(error))
         return false
       }
@@ -243,14 +394,17 @@ function getSafeHyperswarmFactory(factory) {
 
     async _handleNetworkChange(...args) {
       try {
+        addBreadcrumb('swarm.networkChange.start')
         return await super._handleNetworkChange(...args)
       } catch (error) {
+        addBreadcrumb('swarm.networkChange.error', toErrorMessage(error))
         emitError('${ErrorCode.CONNECT_FAILED}', 'Swarm network change failed: ' + toErrorMessage(error))
         return false
       }
     }
 
     join(topic, opts = {}) {
+      addBreadcrumb('swarm.join.call')
       const session = super.join(topic, opts)
       attachDiscoveryErrorHandler(session)
       return session
@@ -262,8 +416,10 @@ function getSafeHyperswarmFactory(factory) {
 
 function writeSocketMessage(targetSocket, message, requestId, failureMessage) {
   try {
+    addBreadcrumb('socket.write.start', failureMessage)
     const writeResult = targetSocket.write(message)
     handleThenable(writeResult, (error) => {
+      addBreadcrumb('socket.write.reject', toErrorMessage(error))
       if (requestId && activeRequestId === requestId) {
         activeRequestId = null
         clearRequestTimeout()
@@ -277,6 +433,7 @@ function writeSocketMessage(targetSocket, message, requestId, failureMessage) {
     })
     return true
   } catch (error) {
+    addBreadcrumb('socket.write.throw', toErrorMessage(error))
     emitError(
       '${ErrorCode.HOST_DISCONNECTED}',
       failureMessage + ': ' + toErrorMessage(error),
@@ -308,11 +465,13 @@ function resetRequestTimeout() {
 
   const timedRequestId = activeRequestId
   clearRequestTimeout()
+  addBreadcrumb('request.timeout.start', timedRequestId)
   requestTimeoutId = setTimeout(() => {
     if (activeRequestId !== timedRequestId) {
       return
     }
 
+    addBreadcrumb('request.timeout.fire', timedRequestId)
     activeRequestId = null
     clearRequestTimeout()
     emitError('${ErrorCode.TIMEOUT_NO_RESPONSE}', 'No response chunk received within 30 seconds', timedRequestId)
@@ -325,11 +484,13 @@ function emitProtocolError(message) {
 
 function startServerInfoTimeout(targetSocket) {
   clearServerInfoTimeout()
+  addBreadcrumb('serverInfo.timeout.start')
   serverInfoTimeoutId = setTimeout(guarded(() => {
     if (socket !== targetSocket || serverInfoReceived) {
       return
     }
 
+    addBreadcrumb('serverInfo.timeout.fire')
     emitError('${ErrorCode.TIMEOUT_NO_RESPONSE}', 'No server_info received within 15 seconds')
     closeResources()
     emit({
@@ -345,6 +506,7 @@ function closeResources() {
     return
   }
 
+  addBreadcrumb('resources.close.start')
   closing = true
   clearServerInfoTimeout()
   clearRequestTimeout()
@@ -365,6 +527,7 @@ function closeResources() {
 
   if (discovery) {
     try {
+      addBreadcrumb('discovery.destroy')
       suppressRejection(discovery.destroy())
     } catch {}
     discovery = null
@@ -372,12 +535,14 @@ function closeResources() {
 
   if (swarm) {
     try {
+      addBreadcrumb('swarm.destroy')
       suppressRejection(swarm.destroy())
     } catch {}
     swarm = null
   }
 
   closing = false
+  addBreadcrumb('resources.close.end')
 }
 
 function nextRequestId() {
@@ -502,6 +667,7 @@ function disconnectForBadInboundBuffer() {
 }
 
 function onSocketData(chunk) {
+  addBreadcrumb('socket.data', String(chunk && chunk.length ? chunk.length : 0))
   inboundBuffer += chunk.toString()
 
   if (Buffer.byteLength(inboundBuffer, 'utf8') > MAX_INBOUND_BUFFER_BYTES) {
@@ -510,7 +676,7 @@ function onSocketData(chunk) {
   }
 
   while (true) {
-    const newlineIndex = inboundBuffer.indexOf('\n')
+    const newlineIndex = inboundBuffer.indexOf('\\n')
     if (newlineIndex === -1) {
       return
     }
@@ -528,10 +694,12 @@ function onSocketData(chunk) {
 
 function attachSocket(nextSocket) {
   if (socket) {
+    addBreadcrumb('socket.attach.ignored')
     destroySocket(nextSocket)
     return
   }
 
+  addBreadcrumb('socket.attach')
   socket = nextSocket
   serverInfoReceived = false
   startServerInfoTimeout(nextSocket)
@@ -539,6 +707,7 @@ function attachSocket(nextSocket) {
   nextSocket.on('data', guarded(onSocketData, '${ErrorCode.BAD_MESSAGE}', 'Failed handling socket data'))
 
   nextSocket.on('close', guarded(() => {
+    addBreadcrumb('socket.close')
     if (closing || socket !== nextSocket) {
       return
     }
@@ -552,6 +721,7 @@ function attachSocket(nextSocket) {
   }, '${ErrorCode.HOST_DISCONNECTED}', 'Socket close handler failed'))
 
   nextSocket.on('error', guarded(() => {
+    addBreadcrumb('socket.error')
     if (closing || socket !== nextSocket) {
       return
     }
@@ -565,7 +735,12 @@ function attachSocket(nextSocket) {
   }, '${ErrorCode.HOST_DISCONNECTED}', 'Socket error handler failed'))
 }
 
-function handleConnect(topicBytes) {
+function handleConnect(topicBytes, diagnosticPhase) {
+  breadcrumbDumped = false
+  breadcrumbSequence = 0
+  breadcrumbBuffer = []
+  setDiagnosticPhase(diagnosticPhase)
+  addBreadcrumb('connect.start')
   closeResources()
 
   if (!Array.isArray(topicBytes)) {
@@ -581,43 +756,93 @@ function handleConnect(topicBytes) {
   }
 
   const topic = Buffer.from(topicBytes)
+  addBreadcrumb('connect.topic.valid')
+
+  if (connectDiagnosticPhase === CONNECT_DIAGNOSTIC_PHASE_DECODE_ONLY) {
+    addBreadcrumb('connect.stop.decode_only')
+    emitError('${ErrorCode.CONNECT_FAILED}', 'Diagnostic mode decode_only stopped before swarm.join')
+    return
+  }
 
   try {
     if (!HyperswarmFactory) {
+      addBreadcrumb('swarm.require.start')
       HyperswarmFactory = require('hyperswarm')
     }
   } catch (error) {
+    addBreadcrumb('swarm.require.error', toErrorMessage(error))
     emitError('${ErrorCode.CONNECT_FAILED}', 'Failed to load Hyperswarm: ' + toErrorMessage(error))
     return
   }
 
   try {
     const HyperswarmCtor = getSafeHyperswarmFactory(HyperswarmFactory)
+    addBreadcrumb('swarm.create.start')
     swarm = new HyperswarmCtor()
+    addBreadcrumb('swarm.create.done')
 
     swarm.on('connection', guarded((nextSocket) => {
+      addBreadcrumb('swarm.connection')
+      if (connectDiagnosticPhase === CONNECT_DIAGNOSTIC_PHASE_JOIN_ONLY) {
+        addBreadcrumb('connect.stop.join_only.connection')
+        destroySocket(nextSocket)
+        closeResources()
+        emit({
+          type: 'onDisconnect',
+          code: '${ErrorCode.USER_DISCONNECTED}',
+          message: 'Diagnostic mode join_only short-circuited after swarm.join'
+        })
+        return
+      }
+
       attachSocket(nextSocket)
     }, '${ErrorCode.CONNECT_FAILED}', 'Failed to attach socket'))
 
     swarm.on('error', guarded((error) => {
+      addBreadcrumb('swarm.error', toErrorMessage(error))
       emitError('${ErrorCode.CONNECT_FAILED}', 'Failed to start Hyperswarm client: ' + toErrorMessage(error))
     }, '${ErrorCode.CONNECT_FAILED}', 'Swarm error handler failed'))
 
-    discovery = swarm.join(topic, { server: false, client: true })
+    addBreadcrumb('swarm.join.start')
+    discovery = swarm.join(topic, {
+      server: false,
+      client: true,
+      onerror: onDiscoveryError
+    })
+    addBreadcrumb('swarm.join.done')
     attachDiscoveryErrorHandler(discovery)
+
+    if (connectDiagnosticPhase === CONNECT_DIAGNOSTIC_PHASE_JOIN_ONLY) {
+      addBreadcrumb('connect.stop.join_only.after_join')
+    }
+
     suppressRejection(
-      discovery.flushed().catch(() => {
+      discovery.flushed().then(() => {
+        addBreadcrumb('swarm.join.flushed')
+        if (connectDiagnosticPhase === CONNECT_DIAGNOSTIC_PHASE_JOIN_ONLY && swarm) {
+          addBreadcrumb('connect.stop.join_only.flushed')
+          closeResources()
+          emit({
+            type: 'onDisconnect',
+            code: '${ErrorCode.USER_DISCONNECTED}',
+            message: 'Diagnostic mode join_only stopped after swarm.join flush'
+          })
+        }
+      }).catch((error) => {
+        addBreadcrumb('swarm.join.flushed.error', toErrorMessage(error))
         closeResources()
         emitError('${ErrorCode.CONNECT_FAILED}', 'Failed to join host topic')
       })
     )
   } catch (error) {
+    addBreadcrumb('swarm.join.throw', toErrorMessage(error))
     closeResources()
     emitError('${ErrorCode.CONNECT_FAILED}', 'Failed to join host topic: ' + toErrorMessage(error))
   }
 }
 
 function handleSendPrompt(prompt) {
+  addBreadcrumb('prompt.send.start')
   if (typeof prompt !== 'string') {
     emitError('${ErrorCode.BAD_MESSAGE}', 'Prompt must be a string')
     return
@@ -646,11 +871,12 @@ function handleSendPrompt(prompt) {
   }
 
   const requestId = nextRequestId()
+  addBreadcrumb('prompt.send.request', requestId)
   const message = JSON.stringify({
     type: 'chat_start',
     request_id: requestId,
     payload: { prompt: normalized }
-  }) + '\n'
+  }) + '\\n'
 
   try {
     emitRawMessage('out', message.trim())
@@ -667,11 +893,12 @@ function handleAbort() {
     return
   }
 
+  addBreadcrumb('prompt.abort', activeRequestId)
   const requestId = activeRequestId
   const message = JSON.stringify({
     type: 'abort',
     request_id: requestId
-  }) + '\n'
+  }) + '\\n'
 
   try {
     emitRawMessage('out', message.trim())
@@ -684,8 +911,13 @@ function handleAbort() {
 }
 
 installUnhandledHooks()
+installPromiseSafetyNet()
 
 IPC.on('data', guarded((chunk) => {
+  installUnhandledHooks()
+  installPromiseSafetyNet()
+  addBreadcrumb('ipc.command.chunk')
+
   let command
   try {
     command = JSON.parse(Buffer.from(chunk).toString())
@@ -698,9 +930,10 @@ IPC.on('data', guarded((chunk) => {
     emitError('${ErrorCode.BAD_MESSAGE}', 'Missing worklet command type')
     return
   }
+  addBreadcrumb('ipc.command.type', command.type)
 
   if (command.type === 'connect') {
-    handleConnect(command.topic)
+    handleConnect(command.topic, command.diagnosticMode)
     return
   }
 
